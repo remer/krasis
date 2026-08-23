@@ -135,6 +135,9 @@ fn select_dspark_diagnostic_verify_rows(
         return Err("D-Spark diagnostic verifier has no legal output rows".to_string());
     }
     if forced_rows > legal_rows {
+        if forced_rows == 2 && remaining_outputs == 1 && legal_rows == 1 {
+            return Ok(1);
+        }
         return Err(format!(
             "D-Spark diagnostic forced {forced_rows} verifier rows but only {legal_rows} are legal"
         ));
@@ -8754,10 +8757,14 @@ pub(crate) mod dsa_registration_tests {
     }
 
     #[test]
-    fn dspark_diagnostic_width_selection_requires_the_exact_forced_width() {
+    fn dspark_diagnostic_width_selection_allows_only_the_terminal_width_two_tail() {
         assert_eq!(select_dspark_diagnostic_verify_rows(1, 5, 40).unwrap(), 1);
         assert_eq!(select_dspark_diagnostic_verify_rows(6, 5, 40).unwrap(), 6);
-        assert!(select_dspark_diagnostic_verify_rows(2, 5, 1).is_err());
+        assert_eq!(select_dspark_diagnostic_verify_rows(2, 5, 2).unwrap(), 2);
+        assert_eq!(select_dspark_diagnostic_verify_rows(2, 5, 1).unwrap(), 1);
+        assert!(select_dspark_diagnostic_verify_rows(3, 5, 1).is_err());
+        assert!(select_dspark_diagnostic_verify_rows(2, 0, 2).is_err());
+        assert!(select_dspark_diagnostic_verify_rows(2, 5, 0).is_err());
         assert!(select_dspark_diagnostic_verify_rows(1, 5, 0).is_err());
     }
 
@@ -77097,11 +77104,21 @@ impl GpuDecodeStore {
                                 runtime
                                     .verification_policy
                                     .validate_hcs_capacity(current_hcs_capacity)?;
+                                let remaining_outputs = max_tokens - step;
                                 let selected_rows = select_dspark_diagnostic_verify_rows(
                                     forced_rows,
                                     proposal.confidences.len(),
-                                    max_tokens - step,
+                                    remaining_outputs,
                                 )?;
+                                if selected_rows != forced_rows {
+                                    eprintln!(
+                                        "D-SPARK DIAGNOSTIC TERMINAL TAIL round={} requested_width={} actual_batch_size={} remaining_outputs={}",
+                                        runtime.batch_verify_rounds,
+                                        forced_rows,
+                                        selected_rows,
+                                        remaining_outputs,
+                                    );
+                                }
                                 let selected_count = runtime
                                     .verification_policy
                                     .selected_counts
