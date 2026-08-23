@@ -36,6 +36,8 @@ const ROUTE_LOCALITY_LFU_DECAY: f32 = 0.97;
 const ROUTE_LOCALITY_ADAPTIVE_DECAY: f64 = 0.90;
 const ROUTE_LOCALITY_ADAPTIVE_SPLITS: &[f64] = &[50.0, 25.0, 75.0, 0.0, 100.0];
 const BF16_MAMBA2_IN_PROJ_PREFILL_EQUIV_MIN_COLS: usize = 33;
+const DSPARK_DIAGNOSTIC_VERIFY_ROWS_ENV: &str = "KRASIS_DSPARK_DIAGNOSTIC_VERIFY_ROWS";
+const DSPARK_DIAGNOSTIC_SCALAR_TARGET_ENV: &str = "KRASIS_DSPARK_DIAGNOSTIC_SCALAR_TARGET";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HcsSoftHostMode {
@@ -61,6 +63,83 @@ fn env_truthy(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn read_dspark_diagnostic_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("invalid {name}; value is not valid Unicode"))
+        }
+    }
+}
+
+fn parse_dspark_diagnostic_scalar_target(raw: Option<&str>) -> Result<bool, String> {
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        value => Err(format!(
+            "invalid {DSPARK_DIAGNOSTIC_SCALAR_TARGET_ENV}={value:?}; expected a boolean"
+        )),
+    }
+}
+
+fn parse_dspark_diagnostic_verify_rows(
+    raw: Option<&str>,
+    maximum_rows: usize,
+) -> Result<Option<usize>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if maximum_rows == 0 {
+        return Err("D-Spark diagnostic verifier has zero row capacity".to_string());
+    }
+    let value = raw.trim();
+    let rows = value.parse::<usize>().map_err(|_| {
+        format!(
+            "invalid {DSPARK_DIAGNOSTIC_VERIFY_ROWS_ENV}={value:?}; expected an integer in 1..={maximum_rows}"
+        )
+    })?;
+    if !(1..=maximum_rows).contains(&rows) {
+        return Err(format!(
+            "invalid {DSPARK_DIAGNOSTIC_VERIFY_ROWS_ENV}={rows}; expected 1..={maximum_rows}"
+        ));
+    }
+    Ok(Some(rows))
+}
+
+fn read_dspark_diagnostic_verify_rows(maximum_rows: usize) -> Result<Option<usize>, String> {
+    let raw = read_dspark_diagnostic_env(DSPARK_DIAGNOSTIC_VERIFY_ROWS_ENV)?;
+    parse_dspark_diagnostic_verify_rows(raw.as_deref(), maximum_rows)
+}
+
+fn read_dspark_diagnostic_scalar_target() -> Result<bool, String> {
+    let raw = read_dspark_diagnostic_env(DSPARK_DIAGNOSTIC_SCALAR_TARGET_ENV)?;
+    parse_dspark_diagnostic_scalar_target(raw.as_deref())
+}
+
+fn select_dspark_diagnostic_verify_rows(
+    forced_rows: usize,
+    proposal_confidences: usize,
+    remaining_outputs: usize,
+) -> Result<usize, String> {
+    let legal_rows = proposal_confidences
+        .checked_add(1)
+        .ok_or_else(|| "D-Spark diagnostic row capacity overflow".to_string())?
+        .min(remaining_outputs);
+    if legal_rows == 0 {
+        return Err("D-Spark diagnostic verifier has no legal output rows".to_string());
+    }
+    if forced_rows > legal_rows {
+        return Err(format!(
+            "D-Spark diagnostic forced {forced_rows} verifier rows but only {legal_rows} are legal"
+        ));
+    }
+    Ok(forced_rows)
 }
 
 fn dependency_preserving_route_schedule(
@@ -8430,15 +8509,17 @@ pub(crate) mod dsa_registration_tests {
         dspark_verification_batch_plan, dynamic_peer_shard, graph_w13_path,
         layer_split_sequence_state_contract, marlin_dispatch_for_bits,
         measured_peer_route_admission, occupancy_active_blocks_per_multiprocessor,
+        parse_dspark_diagnostic_scalar_target, parse_dspark_diagnostic_verify_rows,
         peer_selector_check_message, plan_dsa_topk, route_prep_rmsnorm_threads,
-        split_expert_launch_enabled, validate_dsa_indexer_registration,
-        validate_dsa_owner_weight_contract, validate_dsa_runtime_registration,
-        validate_dspark_residency_contract, validate_stream_probe_outcome, CudaEvent, CudaStream,
-        DsaGraphScoreBackend, DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds,
-        DsparkResidencyMode, DsparkTargetCacheRowMapping, DsparkVerificationPolicy, ExpertDataPtr,
-        GpuAttnConfig, GpuDecodeStore, GpuWeight, GraphW13Path, HqqStageAsyncCopyMode,
-        PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert, PendingPeerDispatch,
-        RouteLocalityGlobalLruState, DSA_TOPK_RADIX_THREADS, MODULE_NAME,
+        select_dspark_diagnostic_verify_rows, split_expert_launch_enabled,
+        validate_dsa_indexer_registration, validate_dsa_owner_weight_contract,
+        validate_dsa_runtime_registration, validate_dspark_residency_contract,
+        validate_stream_probe_outcome, CudaEvent, CudaStream, DsaGraphScoreBackend,
+        DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds, DsparkResidencyMode,
+        DsparkTargetCacheRowMapping, DsparkVerificationPolicy, ExpertDataPtr, GpuAttnConfig,
+        GpuDecodeStore, GpuWeight, GraphW13Path, HqqStageAsyncCopyMode, PeerDemandEntry,
+        PeerDynamicTier, PeerRoutedExpert, PendingPeerDispatch, RouteLocalityGlobalLruState,
+        DSA_TOPK_RADIX_THREADS, MODULE_NAME,
     };
 
     static DSA_CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -8599,6 +8680,45 @@ pub(crate) mod dsa_registration_tests {
         assert!(dspark_verification_batch_plan(10, &[], 1, 1).is_err());
         assert!(dspark_verification_batch_plan(10, &proposals, 0, 1).is_err());
         assert!(dspark_verification_batch_plan(10, &proposals, 1, 0).is_err());
+    }
+
+    #[test]
+    fn dspark_diagnostic_width_parser_is_opt_in_bounded_and_fail_closed() {
+        assert_eq!(parse_dspark_diagnostic_verify_rows(None, 6).unwrap(), None);
+        assert_eq!(
+            parse_dspark_diagnostic_verify_rows(Some("1"), 6).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            parse_dspark_diagnostic_verify_rows(Some("6"), 6).unwrap(),
+            Some(6)
+        );
+        for invalid in ["", "0", "7", "not-a-row"] {
+            assert!(parse_dspark_diagnostic_verify_rows(Some(invalid), 6).is_err());
+        }
+        assert!(parse_dspark_diagnostic_verify_rows(Some("1"), 0).is_err());
+    }
+
+    #[test]
+    fn dspark_diagnostic_scalar_parser_rejects_ambiguous_values() {
+        assert!(!parse_dspark_diagnostic_scalar_target(None).unwrap());
+        for enabled in ["1", "true", "YES", "on"] {
+            assert!(parse_dspark_diagnostic_scalar_target(Some(enabled)).unwrap());
+        }
+        for disabled in ["0", "false", "NO", "off"] {
+            assert!(!parse_dspark_diagnostic_scalar_target(Some(disabled)).unwrap());
+        }
+        for invalid in ["", "enabled", "2"] {
+            assert!(parse_dspark_diagnostic_scalar_target(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn dspark_diagnostic_width_selection_requires_the_exact_forced_width() {
+        assert_eq!(select_dspark_diagnostic_verify_rows(1, 5, 40).unwrap(), 1);
+        assert_eq!(select_dspark_diagnostic_verify_rows(6, 5, 40).unwrap(), 6);
+        assert!(select_dspark_diagnostic_verify_rows(2, 5, 1).is_err());
+        assert!(select_dspark_diagnostic_verify_rows(1, 5, 0).is_err());
     }
 
     #[test]
@@ -69707,6 +69827,38 @@ impl GpuDecodeStore {
                 .and_then(|graph| graph.deepseek_v4_decode_workspace.as_ref())
                 .is_some()
         {
+            let diagnostic_scalar_target = if self
+                .dspark
+                .as_ref()
+                .is_some_and(|runtime| runtime.verification_policy.calibrated)
+            {
+                read_dspark_diagnostic_scalar_target()?
+            } else {
+                false
+            };
+            if diagnostic_scalar_target {
+                if batch_size != 1 {
+                    return Err(format!(
+                        "{DSPARK_DIAGNOSTIC_SCALAR_TARGET_ENV}=1 requires exactly one verifier row, got {batch_size}"
+                    ));
+                }
+                self.gpu_decode_step(tokens[0], positions[0])?;
+                let graph = self
+                    .graph
+                    .as_mut()
+                    .ok_or_else(|| "D-Spark scalar diagnostic lost the decode graph".to_string())?;
+                let vocab_size = graph.vocab_size;
+                if graph.h_logits.len() < vocab_size || graph.h_batch_logits.len() < vocab_size {
+                    return Err(format!(
+                        "D-Spark scalar diagnostic logit capacity mismatch: scalar={} batch={} vocab={vocab_size}",
+                        graph.h_logits.len(),
+                        graph.h_batch_logits.len(),
+                    ));
+                }
+                let scalar_logits = graph.h_logits[..vocab_size].to_vec();
+                graph.h_batch_logits[..vocab_size].copy_from_slice(&scalar_logits);
+                return Ok(1);
+            }
             return self.gpu_decode_step_dspark_target_batched(tokens, positions);
         }
         if batch_size == 1 {
@@ -76589,6 +76741,56 @@ impl GpuDecodeStore {
         // ── Speculative decode state ──
         let use_dspark = self.dspark.is_some();
         let use_speculative = self.draft.is_some();
+        let dspark_diagnostic_runtime = self
+            .dspark
+            .as_ref()
+            .filter(|runtime| runtime.verification_policy.calibrated);
+        let dspark_diagnostic_active = dspark_diagnostic_runtime.is_some();
+        let dspark_diagnostic_verify_rows = if let Some(runtime) = dspark_diagnostic_runtime {
+            let maximum_rows = runtime
+                .block_size
+                .checked_add(1)
+                .ok_or_else(|| "D-Spark diagnostic row capacity overflow".to_string());
+            match maximum_rows
+                .and_then(|maximum_rows| read_dspark_diagnostic_verify_rows(maximum_rows))
+            {
+                Ok(rows) => rows,
+                Err(failure) => {
+                    log::error!("gpu_generate_stream: {}", failure);
+                    self.last_stream_failure = Some(failure);
+                    return 0;
+                }
+            }
+        } else {
+            None
+        };
+        let dspark_diagnostic_scalar_target = if dspark_diagnostic_active {
+            match read_dspark_diagnostic_scalar_target() {
+                Ok(enabled) => enabled,
+                Err(failure) => {
+                    log::error!("gpu_generate_stream: {}", failure);
+                    self.last_stream_failure = Some(failure);
+                    return 0;
+                }
+            }
+        } else {
+            false
+        };
+        if dspark_diagnostic_scalar_target && dspark_diagnostic_verify_rows != Some(1) {
+            let failure = format!(
+                "{DSPARK_DIAGNOSTIC_SCALAR_TARGET_ENV}=1 requires {DSPARK_DIAGNOSTIC_VERIFY_ROWS_ENV}=1"
+            );
+            log::error!("gpu_generate_stream: {}", failure);
+            self.last_stream_failure = Some(failure);
+            return 0;
+        }
+        if let Some(rows) = dspark_diagnostic_verify_rows {
+            log::warn!(
+                "D-Spark diagnostic verifier override armed: rows={} scalar_target={} (startup calibration remains unmodified)",
+                rows,
+                dspark_diagnostic_scalar_target,
+            );
+        }
         if (use_speculative || use_dspark)
             && self
                 .graph
@@ -76808,6 +77010,29 @@ impl GpuDecodeStore {
                         runtime
                             .verification_policy
                             .observe_confidences(&proposal.confidences)?;
+                        if runtime.verification_policy.calibrated {
+                            if let Some(forced_rows) = dspark_diagnostic_verify_rows {
+                                runtime
+                                    .verification_policy
+                                    .validate_hcs_capacity(current_hcs_capacity)?;
+                                let selected_rows = select_dspark_diagnostic_verify_rows(
+                                    forced_rows,
+                                    proposal.confidences.len(),
+                                    max_tokens - step,
+                                )?;
+                                let selected_count = runtime
+                                    .verification_policy
+                                    .selected_counts
+                                    .get_mut(selected_rows - 1)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "D-Spark diagnostic row {selected_rows} exceeds the verification policy"
+                                        )
+                                    })?;
+                                *selected_count = selected_count.saturating_add(1);
+                                return Ok(selected_rows);
+                            }
+                        }
                         runtime.verification_policy.choose_rows(
                             &proposal.confidences,
                             max_tokens - step,
