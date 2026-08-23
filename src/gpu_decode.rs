@@ -300,6 +300,46 @@ fn dspark_trace_bf16_rows(
     Ok(hashes)
 }
 
+fn dspark_trace_f32_host_rows(
+    values: &[f32],
+    rows: usize,
+    stride_elems: usize,
+    row_elems: usize,
+    label: &str,
+) -> Result<Vec<String>, String> {
+    if rows == 0 || row_elems == 0 || stride_elems < row_elems {
+        return Err(format!(
+            "D-Spark {label} host trace geometry is invalid: rows={rows} stride={stride_elems} row={row_elems}"
+        ));
+    }
+    let required = rows
+        .checked_mul(stride_elems)
+        .ok_or_else(|| format!("D-Spark {label} host trace element count overflow"))?;
+    if values.len() < required {
+        return Err(format!(
+            "D-Spark {label} host trace has {} elements but needs {required}",
+            values.len()
+        ));
+    }
+    let mut hashes = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let start = row
+            .checked_mul(stride_elems)
+            .ok_or_else(|| format!("D-Spark {label} host trace row offset overflow"))?;
+        let end = start
+            .checked_add(row_elems)
+            .ok_or_else(|| format!("D-Spark {label} host trace row end overflow"))?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                values[start..end].as_ptr() as *const u8,
+                row_elems * std::mem::size_of::<f32>(),
+            )
+        };
+        hashes.push(format!("{:016x}", validation_fnv1a_u64(bytes)));
+    }
+    Ok(hashes)
+}
+
 fn route_prep_rmsnorm_threads(
     device: &CudaDevice,
     hidden_size: usize,
@@ -8505,7 +8545,7 @@ pub(crate) mod dsa_registration_tests {
     use super::{
         claimed_peer_route_slots, create_decode_timing_event, dependency_preserving_route_schedule,
         dspark_expected_emitted_tokens, dspark_residency_scan_required,
-        dspark_target_cache_restore_slots, dspark_target_cache_rows,
+        dspark_target_cache_restore_slots, dspark_target_cache_rows, dspark_trace_f32_host_rows,
         dspark_verification_batch_plan, dynamic_peer_shard, graph_w13_path,
         layer_split_sequence_state_contract, marlin_dispatch_for_bits,
         measured_peer_route_admission, occupancy_active_blocks_per_multiprocessor,
@@ -8719,6 +8759,20 @@ pub(crate) mod dsa_registration_tests {
         assert_eq!(select_dspark_diagnostic_verify_rows(6, 5, 40).unwrap(), 6);
         assert!(select_dspark_diagnostic_verify_rows(2, 5, 1).is_err());
         assert!(select_dspark_diagnostic_verify_rows(1, 5, 0).is_err());
+    }
+
+    #[test]
+    fn dspark_host_logit_trace_is_row_scoped_deterministic_and_bounded() {
+        let values = [1.0f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 5.0];
+        let hashes = dspark_trace_f32_host_rows(&values, 2, 4, 4, "test").unwrap();
+        assert_eq!(hashes.len(), 2);
+        assert_ne!(hashes[0], hashes[1]);
+        assert_eq!(
+            hashes,
+            dspark_trace_f32_host_rows(&values, 2, 4, 4, "test").unwrap()
+        );
+        assert!(dspark_trace_f32_host_rows(&values, 0, 4, 4, "test").is_err());
+        assert!(dspark_trace_f32_host_rows(&values[..4], 2, 4, 4, "test").is_err());
     }
 
     #[test]
@@ -70145,7 +70199,8 @@ impl GpuDecodeStore {
                 batch_size, graph.batch_max, runtime_batch_max,
             ));
         }
-        let layer_trace_enabled = env_truthy("KRASIS_DSPARK_BATCH_LAYER_TRACE");
+        let layer_trace_enabled =
+            runtime.verification_policy.calibrated && env_truthy("KRASIS_DSPARK_BATCH_LAYER_TRACE");
         if positions
             .windows(2)
             .any(|window| window[0].checked_add(1) != Some(window[1]))
@@ -70502,8 +70557,10 @@ impl GpuDecodeStore {
                     "layer state",
                 )?;
                 eprintln!(
-                    "D-SPARK BATCH LAYER TRACE batch_size={} positions={:?} layer={} ffn_input={:?} attention_state={:?} moe_output={:?} layer_state={:?}",
+                    "D-SPARK BATCH LAYER TRACE round={} batch_size={} tokens={:?} positions={:?} layer={} ffn_input={:?} attention_state={:?} moe_output={:?} layer_state={:?}",
+                    runtime.batch_verify_rounds,
                     batch_size,
+                    tokens,
                     positions,
                     layer_idx,
                     ffn_input,
@@ -70567,6 +70624,31 @@ impl GpuDecodeStore {
             &mut graph.h_batch_logits[..total_logits],
             graph.final_logit_softcap,
         );
+        if layer_trace_enabled {
+            let final_hidden = dspark_trace_bf16_rows(
+                d_batch_hidden_ptr,
+                batch_size,
+                hidden,
+                hidden,
+                "final hidden",
+            )?;
+            let final_logits = dspark_trace_f32_host_rows(
+                &graph.h_batch_logits[..total_logits],
+                batch_size,
+                graph.vocab_size,
+                graph.vocab_size,
+                "final logits",
+            )?;
+            eprintln!(
+                "D-SPARK BATCH HEAD TRACE round={} batch_size={} tokens={:?} positions={:?} final_hidden={:?} final_logits={:?}",
+                runtime.batch_verify_rounds,
+                batch_size,
+                tokens,
+                positions,
+                final_hidden,
+                final_logits,
+            );
+        }
         runtime.batch_head_seconds +=
             self.dspark_timing_checkpoint(head_started, "target batch head")?;
         Ok(batch_size)
