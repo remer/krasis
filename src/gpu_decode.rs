@@ -6012,6 +6012,15 @@ impl HcsState {
             "phase": phase,
             "resident_count": resident.len(),
             "resident_hash": validation_hash_pairs(&resident),
+            "resident_hash_sha256_le_u64": validation_sha256_pairs(&resident),
+            "soft_loaded_slot_proof": validation_sha256_optional_slots_proof(
+                &self.soft_slot_to_expert,
+                loaded_slots,
+            ),
+            "soft_ranking_proof": validation_sha256_pairs_proof(
+                &self.soft_ranking,
+                self.soft_num_slots,
+            ),
             "num_cached": self.num_cached,
             "soft_num_cached": self.soft_num_cached,
             "hard_num_cached": self.num_cached.saturating_sub(self.soft_num_cached),
@@ -6106,6 +6115,87 @@ fn validation_hash_pairs(pairs: &[(usize, usize)]) -> String {
         buf.extend_from_slice(&(expert as u64).to_le_bytes());
     }
     format!("{:016x}", validation_fnv1a_u64(&buf))
+}
+
+fn validation_sha256_pairs(pairs: &[(usize, usize)]) -> String {
+    let mut hasher = Sha256::new();
+    for &(layer, expert) in pairs {
+        hasher.update((layer as u64).to_le_bytes());
+        hasher.update((expert as u64).to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn validation_sha256_pairs_proof(
+    pairs: &[(usize, usize)],
+    requested_len: usize,
+) -> serde_json::Value {
+    let source_len = pairs.len();
+    let hashed_len = source_len.min(requested_len);
+    let exact_len_match = source_len == requested_len;
+    let sha256_le_u64 = if exact_len_match {
+        Some(validation_sha256_pairs(pairs))
+    } else {
+        None
+    };
+    serde_json::json!({
+        "available": exact_len_match,
+        "reason": if exact_len_match { None } else { Some("source_length_mismatch") },
+        "encoding": "sha256(concat(layer.to_le_bytes_u64(), expert.to_le_bytes_u64()) for ordered pair)",
+        "sha256_le_u64": sha256_le_u64,
+        "requested_len": requested_len,
+        "source_len": source_len,
+        "hashed_len": hashed_len,
+        "exact_len_match": exact_len_match,
+    })
+}
+
+fn validation_sha256_optional_slots_proof(
+    slots: &[Option<(usize, usize)>],
+    requested_len: usize,
+) -> serde_json::Value {
+    let source_len = slots.len();
+    let hashed_len = source_len.min(requested_len);
+    let exact_len_match = source_len >= requested_len;
+    let none_count = slots
+        .iter()
+        .take(hashed_len)
+        .filter(|entry| entry.is_none())
+        .count();
+    let available = exact_len_match && none_count == 0;
+    let mut hasher = Sha256::new();
+    for (slot_idx, entry) in slots.iter().take(hashed_len).enumerate() {
+        hasher.update((slot_idx as u64).to_le_bytes());
+        match entry {
+            Some((layer, expert)) => {
+                hasher.update([1u8]);
+                hasher.update((*layer as u64).to_le_bytes());
+                hasher.update((*expert as u64).to_le_bytes());
+            }
+            None => {
+                hasher.update([0u8]);
+                hasher.update(u64::MAX.to_le_bytes());
+                hasher.update(u64::MAX.to_le_bytes());
+            }
+        }
+    }
+    serde_json::json!({
+        "available": available,
+        "reason": if !exact_len_match {
+            Some("source_shorter_than_requested")
+        } else if none_count != 0 {
+            Some("loaded_prefix_contains_empty_slot")
+        } else {
+            None
+        },
+        "encoding": "sha256(concat(slot_index.to_le_bytes_u64(), presence_u8, layer.to_le_bytes_u64(), expert.to_le_bytes_u64()) for ordered loaded prefix; absent coordinates encode UINT64_MAX)",
+        "sha256_le_u64": available.then(|| format!("{:x}", hasher.finalize())),
+        "requested_len": requested_len,
+        "source_len": source_len,
+        "hashed_len": hashed_len,
+        "exact_len_match": exact_len_match,
+        "none_count": none_count,
+    })
 }
 
 fn debug_hash_host_region_json(label: &str, ptr: usize, bytes: usize) -> serde_json::Value {
@@ -9036,8 +9126,9 @@ pub(crate) mod dsa_registration_tests {
         select_dspark_diagnostic_verify_rows, select_dspark_f5_head_parity_enabled,
         split_expert_launch_enabled, validate_dsa_indexer_registration,
         validate_dsa_owner_weight_contract, validate_dsa_runtime_registration,
-        validate_dspark_residency_contract, validate_stream_probe_outcome, CudaEvent, CudaStream,
-        DsaGraphScoreBackend, DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds,
+        validate_dspark_residency_contract, validate_stream_probe_outcome,
+        validation_sha256_optional_slots_proof, validation_sha256_pairs_proof, CudaEvent,
+        CudaStream, DsaGraphScoreBackend, DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds,
         DsparkResidencyMode, DsparkTargetCacheRowMapping, DsparkTargetWidthTimings,
         DsparkVerificationPolicy, ExpertDataPtr, GpuAttnConfig, GpuDecodeStore, GpuWeight,
         GraphW13Path, HqqStageAsyncCopyMode, PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert,
@@ -9046,6 +9137,51 @@ pub(crate) mod dsa_registration_tests {
     };
 
     static DSA_CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn hcs_ordered_hash_proofs_use_fixed_encoding_and_fail_closed() {
+        let pairs = vec![(1usize, 2usize), (3usize, 4usize)];
+        let ranking = validation_sha256_pairs_proof(&pairs, 2);
+        assert_eq!(ranking["available"], true);
+        assert_eq!(ranking["requested_len"], 2);
+        assert_eq!(ranking["source_len"], 2);
+        assert_eq!(ranking["hashed_len"], 2);
+        assert_eq!(
+            ranking["sha256_le_u64"],
+            "73e200e2b048c86d4e8c86b86bf62bbda84c7384e34e250b01aa30ab29d234a4"
+        );
+
+        let slots = vec![Some((1usize, 2usize)), Some((3usize, 4usize))];
+        let slot_proof = validation_sha256_optional_slots_proof(&slots, 2);
+        assert_eq!(slot_proof["available"], true);
+        assert_eq!(slot_proof["none_count"], 0);
+        assert_eq!(
+            slot_proof["sha256_le_u64"],
+            "b5bd65c8a98aa0eb0302d23536bd69866797ac7141356736035ca3ae6958c764"
+        );
+
+        let reversed = validation_sha256_optional_slots_proof(
+            &[Some((3usize, 4usize)), Some((1usize, 2usize))],
+            2,
+        );
+        assert_ne!(reversed["sha256_le_u64"], slot_proof["sha256_le_u64"]);
+
+        let short = validation_sha256_optional_slots_proof(&slots[..1], 2);
+        assert_eq!(short["available"], false);
+        assert_eq!(short["exact_len_match"], false);
+        assert_eq!(short["hashed_len"], 1);
+        assert!(short["sha256_le_u64"].is_null());
+
+        let missing = validation_sha256_optional_slots_proof(&[Some((1usize, 2usize)), None], 2);
+        assert_eq!(missing["available"], false);
+        assert_eq!(missing["none_count"], 1);
+        assert!(missing["sha256_le_u64"].is_null());
+
+        let wrong_ranking_len = validation_sha256_pairs_proof(&pairs, 3);
+        assert_eq!(wrong_ranking_len["available"], false);
+        assert_eq!(wrong_ranking_len["hashed_len"], 2);
+        assert!(wrong_ranking_len["sha256_le_u64"].is_null());
+    }
 
     #[test]
     fn route_locality_global_lru_tracks_cross_layer_capacity() {
@@ -48312,11 +48448,21 @@ impl GpuDecodeStore {
                 .map(|cal| cal.safety_margin_mb as usize)
                 .unwrap_or(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB),
             prefill_hcs_store_addr: 0,
-            prompt_hcs_shadow_enabled: false,
+            prompt_hcs_collection_enabled: false,
             prompt_hcs_counts: Vec::new(),
             prompt_hcs_num_moe_layers: 0,
             prompt_hcs_num_experts_per_layer: 0,
             prompt_hcs_prompt_tokens: 0,
+            prompt_hcs_expected_layers: Vec::new(),
+            prompt_hcs_observed_layers: Vec::new(),
+            prompt_hcs_expected_layer_route_count_sums: Vec::new(),
+            prompt_hcs_observed_layer_route_count_sums: Vec::new(),
+            prompt_hcs_layer_record_calls: Vec::new(),
+            prompt_hcs_expected_calls_per_layer: None,
+            prompt_hcs_record_calls: 0,
+            prompt_hcs_expected_route_count_sum: None,
+            prompt_hcs_observed_route_count_sum: None,
+            prompt_hcs_proof_arithmetic_valid: true,
         };
         engine.initialize_tileq_capture_from_env()?;
         Ok(engine)

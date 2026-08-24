@@ -6255,6 +6255,7 @@ fn handle_reference_test(stream: &mut TcpStream, body: &str, state: &mut ServerS
         ));
     }
 
+    let prompt_hcs_proof = engine.prompt_hcs_proof_json();
     let prompt_hcs_snapshot = engine.prompt_hcs_shadow_snapshot();
 
     // Set KV position and swap to simple INT4 for decode
@@ -6683,6 +6684,8 @@ fn handle_reference_test(stream: &mut TcpStream, body: &str, state: &mut ServerS
                 "prepare_for_prefill_prompt_tokens": input_token_ids.len(),
                 "scratch_tokens_after_prepare": scratch_tokens_after_prepare,
                 "prefill_chunk_size_after_prepare": prefill_chunk_size_after_prepare,
+                "prefill_retry_attempts": retry_attempt,
+                "prefill_final_retry_chunk_cap": retry_cap,
                 "release_scratch_called": true,
                 "restore_runtime_for_decode_called": true,
                 "decode_kv_position_set_to_prompt_len": prompt_len,
@@ -6692,6 +6695,7 @@ fn handle_reference_test(stream: &mut TcpStream, body: &str, state: &mut ServerS
                 "hcs_sync_soft_reload_dma_ms": dma_ms,
                 "server_cleanup_called": server_cleanup_called
             },
+            "prompt_hcs_proof": prompt_hcs_proof,
             "prefill_stage_trace": debug_prefill_stage_trace.unwrap_or_else(|| serde_json::json!({"available": false})),
             "prefill_logits": debug_prefill_logits.unwrap_or_else(|| serde_json::json!({"available": false})),
             "prompt_debug": reference_prompt_debug.clone().unwrap_or_else(|| serde_json::json!({"available": false})),
