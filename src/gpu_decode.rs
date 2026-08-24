@@ -598,16 +598,22 @@ fn select_dspark_diagnostic_verify_rows(
     proposal_confidences: usize,
     remaining_outputs: usize,
 ) -> Result<usize, String> {
-    let legal_rows = proposal_confidences
+    let proposal_rows = proposal_confidences
         .checked_add(1)
-        .ok_or_else(|| "D-Spark diagnostic row capacity overflow".to_string())?
-        .min(remaining_outputs);
+        .ok_or_else(|| "D-Spark diagnostic row capacity overflow".to_string())?;
+    let legal_rows = proposal_rows.min(remaining_outputs);
     if legal_rows == 0 {
         return Err("D-Spark diagnostic verifier has no legal output rows".to_string());
     }
     if forced_rows > legal_rows {
-        if forced_rows == 2 && remaining_outputs == 1 && legal_rows == 1 {
-            return Ok(1);
+        // A fixed-width diagnostic still has to finish a request whose output
+        // budget is shorter than that width.  Permit only that terminal tail;
+        // a proposal-capacity shortfall remains a fail-closed error.
+        if proposal_rows >= forced_rows
+            && remaining_outputs < forced_rows
+            && legal_rows == remaining_outputs
+        {
+            return Ok(legal_rows);
         }
         return Err(format!(
             "D-Spark diagnostic forced {forced_rows} verifier rows but only {legal_rows} are legal"
@@ -9230,12 +9236,18 @@ pub(crate) mod dsa_registration_tests {
     }
 
     #[test]
-    fn dspark_diagnostic_width_selection_allows_only_the_terminal_width_two_tail() {
+    fn dspark_diagnostic_width_selection_allows_only_terminal_output_tails() {
         assert_eq!(select_dspark_diagnostic_verify_rows(1, 5, 40).unwrap(), 1);
         assert_eq!(select_dspark_diagnostic_verify_rows(6, 5, 40).unwrap(), 6);
         assert_eq!(select_dspark_diagnostic_verify_rows(2, 5, 2).unwrap(), 2);
         assert_eq!(select_dspark_diagnostic_verify_rows(2, 5, 1).unwrap(), 1);
-        assert!(select_dspark_diagnostic_verify_rows(3, 5, 1).is_err());
+        assert_eq!(select_dspark_diagnostic_verify_rows(3, 5, 2).unwrap(), 2);
+        assert_eq!(select_dspark_diagnostic_verify_rows(3, 5, 1).unwrap(), 1);
+        assert_eq!(select_dspark_diagnostic_verify_rows(6, 5, 5).unwrap(), 5);
+        assert!(select_dspark_diagnostic_verify_rows(3, 1, 10).is_err());
+        assert!(select_dspark_diagnostic_verify_rows(3, 1, 2).is_err());
+        assert!(select_dspark_diagnostic_verify_rows(3, 1, 1).is_err());
+        assert!(select_dspark_diagnostic_verify_rows(6, 4, 5).is_err());
         assert!(select_dspark_diagnostic_verify_rows(2, 0, 2).is_err());
         assert!(select_dspark_diagnostic_verify_rows(2, 5, 0).is_err());
         assert!(select_dspark_diagnostic_verify_rows(1, 5, 0).is_err());
