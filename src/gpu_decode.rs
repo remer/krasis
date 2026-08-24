@@ -9122,16 +9122,17 @@ pub(crate) mod dsa_registration_tests {
         marlin_dispatch_for_bits, measured_peer_route_admission,
         occupancy_active_blocks_per_multiprocessor, parse_dspark_diagnostic_scalar_target,
         parse_dspark_diagnostic_verify_rows, parse_dspark_f5_head_parity_enabled,
-        peer_selector_check_message, plan_dsa_topk, route_prep_rmsnorm_threads,
-        select_dspark_diagnostic_verify_rows, select_dspark_f5_head_parity_enabled,
-        split_expert_launch_enabled, validate_dsa_indexer_registration,
-        validate_dsa_owner_weight_contract, validate_dsa_runtime_registration,
-        validate_dspark_residency_contract, validate_stream_probe_outcome,
-        validation_sha256_optional_slots_proof, validation_sha256_pairs_proof, CudaEvent,
-        CudaStream, DsaGraphScoreBackend, DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds,
-        DsparkResidencyMode, DsparkTargetCacheRowMapping, DsparkTargetWidthTimings,
-        DsparkVerificationPolicy, ExpertDataPtr, GpuAttnConfig, GpuDecodeStore, GpuWeight,
-        GraphW13Path, HqqStageAsyncCopyMode, PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert,
+        peer_selector_check_message, plan_dsa_topk, preserve_checkpoint_hcs_order_for_dspark,
+        route_prep_rmsnorm_threads, select_dspark_diagnostic_verify_rows,
+        select_dspark_f5_head_parity_enabled, split_expert_launch_enabled,
+        validate_dsa_indexer_registration, validate_dsa_owner_weight_contract,
+        validate_dsa_runtime_registration, validate_dspark_residency_contract,
+        validate_stream_probe_outcome, validation_sha256_optional_slots_proof,
+        validation_sha256_pairs_proof, CudaEvent, CudaStream, DsaGraphScoreBackend,
+        DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds, DsparkResidencyMode,
+        DsparkTargetCacheRowMapping, DsparkTargetWidthTimings, DsparkVerificationPolicy,
+        ExpertDataPtr, GpuAttnConfig, GpuDecodeStore, GpuWeight, GraphW13Path,
+        HqqStageAsyncCopyMode, PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert,
         PendingPeerDispatch, RouteLocalityGlobalLruState, DSA_TOPK_RADIX_THREADS,
         DSPARK_F5_ARTIFACT_NAMES, MODULE_NAME,
     };
@@ -9311,6 +9312,17 @@ pub(crate) mod dsa_registration_tests {
         .is_err());
         assert!(validate_dspark_residency_contract(DsparkResidencyMode::Shared, 0, 768,).is_ok());
         assert!(validate_dspark_residency_contract(DsparkResidencyMode::Shared, 1, 0,).is_err());
+    }
+
+    #[test]
+    fn dspark_checkpoint_hcs_order_policy_covers_resident_and_shared_modes() {
+        assert!(!preserve_checkpoint_hcs_order_for_dspark(None));
+        assert!(preserve_checkpoint_hcs_order_for_dspark(Some(
+            DsparkResidencyMode::Resident,
+        )));
+        assert!(preserve_checkpoint_hcs_order_for_dspark(Some(
+            DsparkResidencyMode::Shared,
+        )));
     }
 
     #[test]
@@ -21160,6 +21172,10 @@ impl DeepseekV4DecodePolicy {
 enum DsparkResidencyMode {
     Resident,
     Shared,
+}
+
+fn preserve_checkpoint_hcs_order_for_dspark(mode: Option<DsparkResidencyMode>) -> bool {
+    mode.is_some()
 }
 
 impl DsparkResidencyMode {
@@ -76355,10 +76371,9 @@ impl GpuDecodeStore {
     /// Returns (loaded_count, reload_ms).
     pub fn hcs_reload_after_prefill(&mut self, actual_tokens: usize) -> (usize, f64) {
         let cal = self.vram_calibration;
-        let preserve_dspark_resident_order = self
-            .dspark
-            .as_ref()
-            .is_some_and(|runtime| runtime.mode == DsparkResidencyMode::Resident);
+        let dspark_mode = self.dspark.as_ref().map(|runtime| runtime.mode);
+        let preserve_dspark_checkpoint_order =
+            preserve_checkpoint_hcs_order_for_dspark(dspark_mode);
         let device_id = self.device.ordinal() as i32;
         let trace_cfg = self.active_trace_owned();
         let route_sync_device = self.device.clone();
@@ -76433,7 +76448,22 @@ impl GpuDecodeStore {
             }
         }
 
-        if !preserve_dspark_resident_order
+        if preserve_dspark_checkpoint_order
+            && prompt_hcs_reload_enabled()
+            && !prompt_counts.is_empty()
+            && target_chunks > 0
+            && prompt_hcs_log_enabled()
+        {
+            eprintln!(
+                "[PROMPT-HCS] reload preserve checkpoint order dspark_mode={} prompt_tokens={} target_chunks={} loaded_chunks={}",
+                dspark_mode.expect("D-Spark preservation requires a residency mode").label(),
+                prompt_tokens,
+                target_chunks,
+                hcs.soft_chunks_loaded,
+            );
+        }
+
+        if !preserve_dspark_checkpoint_order
             && prompt_hcs_reload_enabled()
             && !prompt_counts.is_empty()
             && target_chunks > 0
@@ -76779,10 +76809,9 @@ impl GpuDecodeStore {
             return self.hcs_reload_after_prefill(actual_tokens);
         }
         let cal = self.vram_calibration;
-        let preserve_dspark_resident_order = self
-            .dspark
-            .as_ref()
-            .is_some_and(|runtime| runtime.mode == DsparkResidencyMode::Resident);
+        let dspark_mode = self.dspark.as_ref().map(|runtime| runtime.mode);
+        let preserve_dspark_checkpoint_order =
+            preserve_checkpoint_hcs_order_for_dspark(dspark_mode);
         let device_id = self.device.ordinal() as i32;
         let trace_cfg = self.active_trace_owned();
         let route_sync_device = self.device.clone();
@@ -76857,7 +76886,22 @@ impl GpuDecodeStore {
             }
         }
 
-        if !preserve_dspark_resident_order
+        if preserve_dspark_checkpoint_order
+            && prompt_hcs_reload_enabled()
+            && !prompt_counts.is_empty()
+            && target_chunks > 0
+            && prompt_hcs_log_enabled()
+        {
+            eprintln!(
+                "[PROMPT-HCS] reload preserve checkpoint order dspark_mode={} prompt_tokens={} target_chunks={} loaded_chunks={}",
+                dspark_mode.expect("D-Spark preservation requires a residency mode").label(),
+                prompt_tokens,
+                target_chunks,
+                hcs.soft_chunks_loaded,
+            );
+        }
+
+        if !preserve_dspark_checkpoint_order
             && prompt_hcs_reload_enabled()
             && !prompt_counts.is_empty()
             && target_chunks > 0
