@@ -24,6 +24,7 @@ use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cudarc::driver::sys as cuda_sys;
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr};
 use pyo3::prelude::*;
+use sha2::{Digest, Sha256};
 
 use crate::weights::marlin::{
     bf16_to_f32, dequantize_marlin, dequantize_marlin_int8, generate_scale_perms,
@@ -58,6 +59,296 @@ fn prefill_debug_enabled() -> bool {
     std::env::var("KRASIS_PREFILL_DEBUG")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+fn prefill_chunk_plan_proof_json(
+    chunk_plan: &[usize],
+    total_tokens: usize,
+    max_chunk_tokens: usize,
+    capture_suffix_boundary: Option<usize>,
+    sequence_start: usize,
+    reset_sequence_state: bool,
+) -> serde_json::Value {
+    let mut hasher = Sha256::new();
+    let mut encoding_valid = true;
+    for &tokens in chunk_plan {
+        match u64::try_from(tokens) {
+            Ok(tokens) => hasher.update(tokens.to_le_bytes()),
+            Err(_) => encoding_valid = false,
+        }
+    }
+    let chunk_token_sum = chunk_plan
+        .iter()
+        .try_fold(0usize, |sum, &tokens| sum.checked_add(tokens));
+    let logical_prompt_tokens = sequence_start.checked_add(total_tokens);
+    let chunks_nonempty = !chunk_plan.is_empty();
+    let chunks_positive = chunks_nonempty && chunk_plan.iter().all(|&tokens| tokens > 0);
+    let chunks_within_max =
+        max_chunk_tokens > 0 && chunk_plan.iter().all(|&tokens| tokens <= max_chunk_tokens);
+    let chunk_sum_matches_total = chunk_token_sum == Some(total_tokens);
+    let state_mode_matches_boundary = reset_sequence_state == (sequence_start == 0);
+    let capture_boundary_aligned = capture_suffix_boundary.map_or(true, |boundary| {
+        let mut cumulative = Some(0usize);
+        chunk_plan.iter().any(|&tokens| {
+            cumulative = cumulative.and_then(|sum| sum.checked_add(tokens));
+            cumulative == Some(boundary)
+        })
+    });
+    let available = encoding_valid
+        && logical_prompt_tokens.is_some()
+        && chunks_positive
+        && chunks_within_max
+        && chunk_sum_matches_total
+        && state_mode_matches_boundary
+        && capture_boundary_aligned;
+    serde_json::json!({
+        "available": available,
+        "encoding": "sha256(concat(chunk_tokens.to_le_bytes_u64()) for chunk_tokens in plan)",
+        "sha256_le_u64": encoding_valid.then(|| format!("{:x}", hasher.finalize())),
+        "chunk_count": chunk_plan.len(),
+        "chunk_token_sum": chunk_token_sum,
+        "max_planned_chunk_tokens": chunk_plan.iter().copied().max().unwrap_or(0),
+        "computed_suffix_tokens": total_tokens,
+        "logical_prompt_tokens": logical_prompt_tokens,
+        "sequence_start": sequence_start,
+        "reset_sequence_state": reset_sequence_state,
+        "state_mode": if reset_sequence_state { "fresh" } else { "continuation" },
+        "max_chunk_tokens": max_chunk_tokens,
+        "capture_suffix_boundary": capture_suffix_boundary,
+        "encoding_valid": encoding_valid,
+        "chunks_nonempty": chunks_nonempty,
+        "chunks_positive": chunks_positive,
+        "chunks_within_max": chunks_within_max,
+        "chunk_sum_matches_total": chunk_sum_matches_total,
+        "state_mode_matches_boundary": state_mode_matches_boundary,
+        "capture_boundary_aligned": capture_boundary_aligned,
+    })
+}
+
+struct PromptHcsProofInputs<'a> {
+    proof_gate_enabled: bool,
+    collection_enabled: bool,
+    reload_requested: bool,
+    decode_shadow_install_requested: bool,
+    counts: &'a [u64],
+    num_moe_layers: usize,
+    num_experts_per_layer: usize,
+    prompt_tokens: usize,
+    expected_layers: &'a [bool],
+    observed_layers: &'a [bool],
+    expected_layer_route_count_sums: &'a [Option<u64>],
+    observed_layer_route_count_sums: &'a [Option<u64>],
+    layer_record_calls: &'a [usize],
+    expected_calls_per_layer: Option<usize>,
+    record_calls: usize,
+    expected_route_count_sum: Option<u64>,
+    observed_route_count_sum: Option<u64>,
+    arithmetic_valid: bool,
+}
+
+fn prompt_hcs_count_proof_json(inputs: PromptHcsProofInputs<'_>) -> serde_json::Value {
+    let expected_count_vector_len = inputs
+        .num_moe_layers
+        .checked_mul(inputs.num_experts_per_layer);
+    let count_vector_dimensions_match = expected_count_vector_len == Some(inputs.counts.len());
+    let layer_vector_dimensions_match = inputs.expected_layers.len() == inputs.num_moe_layers
+        && inputs.observed_layers.len() == inputs.num_moe_layers
+        && inputs.expected_layer_route_count_sums.len() == inputs.num_moe_layers
+        && inputs.observed_layer_route_count_sums.len() == inputs.num_moe_layers
+        && inputs.layer_record_calls.len() == inputs.num_moe_layers;
+    let dimensions_match = count_vector_dimensions_match && layer_vector_dimensions_match;
+    let count_sum = inputs
+        .counts
+        .iter()
+        .try_fold(0u64, |sum, &count| sum.checked_add(count));
+    let expected_moe_layers = inputs.expected_layers.iter().filter(|&&seen| seen).count();
+    let observed_moe_layers = inputs.observed_layers.iter().filter(|&&seen| seen).count();
+    let layer_coverage_complete =
+        layer_vector_dimensions_match && inputs.observed_layers == inputs.expected_layers;
+    let per_layer_route_coverage_complete = layer_vector_dimensions_match
+        && inputs
+            .expected_layers
+            .iter()
+            .zip(inputs.expected_layer_route_count_sums.iter())
+            .zip(inputs.observed_layer_route_count_sums.iter())
+            .all(|((&expected_layer, expected_sum), observed_sum)| {
+                if expected_layer {
+                    expected_sum.is_some() && expected_sum == observed_sum
+                } else {
+                    expected_sum.is_none() && *observed_sum == Some(0)
+                }
+            });
+    let per_layer_call_coverage_complete = layer_vector_dimensions_match
+        && inputs.expected_calls_per_layer.is_some()
+        && inputs
+            .expected_layers
+            .iter()
+            .zip(inputs.layer_record_calls.iter())
+            .all(|(&expected_layer, &calls)| {
+                if expected_layer {
+                    Some(calls) == inputs.expected_calls_per_layer
+                } else {
+                    calls == 0
+                }
+            });
+    let expected_record_calls = inputs
+        .expected_calls_per_layer
+        .and_then(|calls| expected_moe_layers.checked_mul(calls));
+    let expected_record_calls_arithmetic_valid =
+        inputs.expected_calls_per_layer.is_none() || expected_record_calls.is_some();
+    let observed_record_call_sum = inputs
+        .layer_record_calls
+        .iter()
+        .try_fold(0usize, |sum, &calls| sum.checked_add(calls));
+    let layer_record_calls_u64 = inputs
+        .layer_record_calls
+        .iter()
+        .copied()
+        .map(u64::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .ok();
+    let record_call_accounting_complete = expected_record_calls == Some(inputs.record_calls)
+        && observed_record_call_sum == Some(inputs.record_calls);
+    let routed_count_coverage_complete = inputs.expected_route_count_sum.is_some()
+        && inputs.expected_route_count_sum == inputs.observed_route_count_sum
+        && inputs.observed_route_count_sum == count_sum;
+    let arithmetic_valid = inputs.arithmetic_valid
+        && expected_count_vector_len.is_some()
+        && count_sum.is_some()
+        && expected_record_calls_arithmetic_valid
+        && observed_record_call_sum.is_some()
+        && layer_record_calls_u64.is_some();
+    let available = inputs.proof_gate_enabled
+        && inputs.collection_enabled
+        && dimensions_match
+        && layer_coverage_complete
+        && per_layer_route_coverage_complete
+        && per_layer_call_coverage_complete
+        && record_call_accounting_complete
+        && routed_count_coverage_complete
+        && arithmetic_valid;
+    let reason = if !inputs.proof_gate_enabled {
+        Some("proof_gate_disabled")
+    } else if !inputs.collection_enabled {
+        Some("collection_disabled")
+    } else if !dimensions_match {
+        Some("proof_vector_dimension_mismatch")
+    } else if !arithmetic_valid {
+        Some("checked_arithmetic_failure")
+    } else if !layer_coverage_complete {
+        Some("incomplete_moe_layer_coverage")
+    } else if !per_layer_route_coverage_complete {
+        Some("per_layer_route_count_mismatch")
+    } else if !per_layer_call_coverage_complete || !record_call_accounting_complete {
+        Some("per_layer_record_call_mismatch")
+    } else if !routed_count_coverage_complete {
+        Some("routed_count_sum_mismatch")
+    } else {
+        None
+    };
+
+    let mut count_hasher = Sha256::new();
+    for &count in inputs.counts {
+        count_hasher.update(count.to_le_bytes());
+    }
+    let mut expected_layer_hasher = Sha256::new();
+    for &present in inputs.expected_layers {
+        expected_layer_hasher.update([u8::from(present)]);
+    }
+    let mut observed_layer_hasher = Sha256::new();
+    for &present in inputs.observed_layers {
+        observed_layer_hasher.update([u8::from(present)]);
+    }
+    let mut expected_route_hasher = Sha256::new();
+    for &value in inputs.expected_layer_route_count_sums {
+        match value {
+            Some(value) => {
+                expected_route_hasher.update([1u8]);
+                expected_route_hasher.update(value.to_le_bytes());
+            }
+            None => {
+                expected_route_hasher.update([0u8]);
+                expected_route_hasher.update(u64::MAX.to_le_bytes());
+            }
+        }
+    }
+    let mut observed_route_hasher = Sha256::new();
+    for &value in inputs.observed_layer_route_count_sums {
+        match value {
+            Some(value) => {
+                observed_route_hasher.update([1u8]);
+                observed_route_hasher.update(value.to_le_bytes());
+            }
+            None => {
+                observed_route_hasher.update([0u8]);
+                observed_route_hasher.update(u64::MAX.to_le_bytes());
+            }
+        }
+    }
+    let mut layer_calls_hasher = Sha256::new();
+    if let Some(calls) = layer_record_calls_u64.as_ref() {
+        for &call_count in calls {
+            layer_calls_hasher.update(call_count.to_le_bytes());
+        }
+    }
+
+    let mut proof = serde_json::json!({
+        "available": available,
+        "reason": reason,
+        "source": "prefill fused-MoE expert-count download",
+        "collection_path": "fused_moe_only",
+        "count_encoding": "sha256(concat(count.to_le_bytes_u64()) for count in route_count_vector)",
+        "count_sha256_le_u64": available.then(|| format!("{:x}", count_hasher.finalize())),
+        "layer_bitmap_encoding": "sha256(concat(u8::from(layer_present)) for ordered moe_layer_slot)",
+        "expected_layer_bitmap_sha256": layer_vector_dimensions_match
+            .then(|| format!("{:x}", expected_layer_hasher.finalize())),
+        "observed_layer_bitmap_sha256": layer_vector_dimensions_match
+            .then(|| format!("{:x}", observed_layer_hasher.finalize())),
+        "per_layer_route_sum_encoding": "sha256(concat(presence_u8, route_sum.to_le_bytes_u64()) for ordered moe_layer_slot; absent sums encode UINT64_MAX)",
+        "expected_per_layer_route_sum_sha256": layer_vector_dimensions_match
+            .then(|| format!("{:x}", expected_route_hasher.finalize())),
+        "observed_per_layer_route_sum_sha256": layer_vector_dimensions_match
+            .then(|| format!("{:x}", observed_route_hasher.finalize())),
+        "per_layer_call_encoding": "sha256(concat(record_calls.to_le_bytes_u64()) for ordered moe_layer_slot)",
+        "per_layer_record_calls_sha256": (layer_vector_dimensions_match && layer_record_calls_u64.is_some())
+            .then(|| format!("{:x}", layer_calls_hasher.finalize())),
+        "proof_gate_enabled": inputs.proof_gate_enabled,
+        "collection_enabled": inputs.collection_enabled,
+        "reload_requested": inputs.reload_requested,
+        "decode_shadow_install_requested": inputs.decode_shadow_install_requested,
+        "count_vector_len": inputs.counts.len(),
+        "expected_count_vector_len": expected_count_vector_len,
+        "count_vector_dimensions_match": count_vector_dimensions_match,
+        "expected_layer_vector_len": inputs.expected_layers.len(),
+        "observed_layer_vector_len": inputs.observed_layers.len(),
+        "layer_vector_dimensions_match": layer_vector_dimensions_match,
+        "dimensions_match": dimensions_match,
+    });
+    let accounting = serde_json::json!({
+        "nonzero_count": inputs.counts.iter().filter(|&&count| count != 0).count(),
+        "count_sum": count_sum,
+        "expected_route_count_sum": inputs.expected_route_count_sum,
+        "observed_route_count_sum": inputs.observed_route_count_sum,
+        "routed_count_coverage_complete": routed_count_coverage_complete,
+        "expected_moe_layers": expected_moe_layers,
+        "observed_moe_layers": observed_moe_layers,
+        "layer_coverage_complete": layer_coverage_complete,
+        "per_layer_route_coverage_complete": per_layer_route_coverage_complete,
+        "expected_calls_per_layer": inputs.expected_calls_per_layer,
+        "per_layer_call_coverage_complete": per_layer_call_coverage_complete,
+        "expected_record_calls": expected_record_calls,
+        "observed_record_call_sum": observed_record_call_sum,
+        "record_call_accounting_complete": record_call_accounting_complete,
+        "record_calls": inputs.record_calls,
+        "arithmetic_valid": arithmetic_valid,
+        "moe_layer_slots": inputs.num_moe_layers,
+        "experts_per_layer": inputs.num_experts_per_layer,
+        "prompt_tokens": inputs.prompt_tokens,
+    });
+    if let (Some(proof), Some(accounting)) = (proof.as_object_mut(), accounting.as_object()) {
+        proof.extend(accounting.clone());
+    }
+    proof
 }
 
 fn prefill_ptr_table_reuse_enabled() -> bool {
@@ -3101,7 +3392,22 @@ fn reference_lm_head_logit_trace_json(
 
     let mut max_logit = f32::NEG_INFINITY;
     let mut max_token = 0usize;
+    let mut finite_count = 0usize;
+    let mut nan_count = 0usize;
+    let mut pos_inf_count = 0usize;
+    let mut neg_inf_count = 0usize;
+    let mut hasher = Sha256::new();
     for (idx, &value) in logits[..vocab_size].iter().enumerate() {
+        hasher.update(value.to_bits().to_le_bytes());
+        if value.is_nan() {
+            nan_count += 1;
+        } else if value == f32::INFINITY {
+            pos_inf_count += 1;
+        } else if value == f32::NEG_INFINITY {
+            neg_inf_count += 1;
+        } else {
+            finite_count += 1;
+        }
         if !value.is_nan() && value > max_logit {
             max_logit = value;
             max_token = idx;
@@ -3148,10 +3454,15 @@ fn reference_lm_head_logit_trace_json(
 
     serde_json::json!({
         "available": true,
-        "source": "prefill_engine.scratch.d_logits_after_lm_head_before_suppression",
+        "source": "prefill_engine.scratch.d_logits_after_lm_head_before_softcap_and_suppression",
         "dtype": "f32",
         "device_before_download": "cuda",
         "vocab_size": vocab_size,
+        "sha256_le_f32_bits": format!("{:x}", hasher.finalize()),
+        "finite_count": finite_count,
+        "nan_count": nan_count,
+        "pos_inf_count": pos_inf_count,
+        "neg_inf_count": neg_inf_count,
         "selected_token_id": selected_token,
         "selected_raw_logit": selected_raw as f64,
         "selected_logprob_from_raw": selected_raw as f64 - logsumexp,
@@ -9535,11 +9846,21 @@ pub struct PrefillEngine {
     pub prefill_hcs_store_addr: usize,
     /// Request-scoped prompt expert-use histogram for prompt-conditioned HCS diagnostics.
     /// Flat [moe_layer_idx * num_experts_per_layer + expert_id] counts selected routes during exact prefill.
-    pub prompt_hcs_shadow_enabled: bool,
+    pub prompt_hcs_collection_enabled: bool,
     pub prompt_hcs_counts: Vec<u64>,
     pub prompt_hcs_num_moe_layers: usize,
     pub prompt_hcs_num_experts_per_layer: usize,
     pub prompt_hcs_prompt_tokens: usize,
+    pub prompt_hcs_expected_layers: Vec<bool>,
+    pub prompt_hcs_observed_layers: Vec<bool>,
+    pub prompt_hcs_expected_layer_route_count_sums: Vec<Option<u64>>,
+    pub prompt_hcs_observed_layer_route_count_sums: Vec<Option<u64>>,
+    pub prompt_hcs_layer_record_calls: Vec<usize>,
+    pub prompt_hcs_expected_calls_per_layer: Option<usize>,
+    pub prompt_hcs_record_calls: usize,
+    pub prompt_hcs_expected_route_count_sum: Option<u64>,
+    pub prompt_hcs_observed_route_count_sum: Option<u64>,
+    pub prompt_hcs_proof_arithmetic_valid: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -9775,30 +10096,63 @@ impl PrefillEngine {
             )
     }
 
-    fn prompt_hcs_shadow_env_enabled() -> bool {
-        let shadow = std::env::var("KRASIS_PROMPT_HCS_SHADOW")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-        let reload = std::env::var("KRASIS_PROMPT_HCS_RELOAD")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                )
-            })
-            .unwrap_or(true);
-        shadow || reload
+    fn prompt_hcs_enabled_default_from_value(
+        value: Result<Option<&str>, ()>,
+        default: bool,
+    ) -> bool {
+        match value {
+            Ok(Some(value)) => match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => default,
+            },
+            Ok(None) | Err(()) => default,
+        }
+    }
+
+    fn prompt_hcs_env_enabled_default(name: &str, default: bool) -> bool {
+        match std::env::var(name) {
+            Ok(value) => Self::prompt_hcs_enabled_default_from_value(Ok(Some(&value)), default),
+            Err(std::env::VarError::NotPresent) => {
+                Self::prompt_hcs_enabled_default_from_value(Ok(None), default)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Self::prompt_hcs_enabled_default_from_value(Err(()), default)
+            }
+        }
+    }
+
+    fn prompt_hcs_proof_env_enabled() -> bool {
+        Self::prompt_hcs_env_enabled_default("KRASIS_PROMPT_HCS_PROOF", false)
+    }
+
+    fn prompt_hcs_reload_env_enabled() -> bool {
+        Self::prompt_hcs_env_enabled_default("KRASIS_PROMPT_HCS_RELOAD", true)
+    }
+
+    fn prompt_hcs_shadow_install_env_enabled() -> bool {
+        Self::prompt_hcs_env_enabled_default("KRASIS_PROMPT_HCS_SHADOW", false)
+            || Self::prompt_hcs_reload_env_enabled()
+    }
+
+    fn prompt_hcs_collection_env_enabled() -> bool {
+        Self::prompt_hcs_shadow_install_env_enabled() || Self::prompt_hcs_proof_env_enabled()
     }
 
     fn reset_prompt_hcs_shadow(&mut self, prompt_tokens: usize) {
-        self.prompt_hcs_shadow_enabled = Self::prompt_hcs_shadow_env_enabled();
+        self.prompt_hcs_collection_enabled = Self::prompt_hcs_collection_env_enabled();
         self.prompt_hcs_prompt_tokens = prompt_tokens;
-        if !self.prompt_hcs_shadow_enabled {
+        self.prompt_hcs_expected_layers.clear();
+        self.prompt_hcs_observed_layers.clear();
+        self.prompt_hcs_expected_layer_route_count_sums.clear();
+        self.prompt_hcs_observed_layer_route_count_sums.clear();
+        self.prompt_hcs_layer_record_calls.clear();
+        self.prompt_hcs_expected_calls_per_layer = None;
+        self.prompt_hcs_record_calls = 0;
+        self.prompt_hcs_expected_route_count_sum = None;
+        self.prompt_hcs_observed_route_count_sum = Some(0);
+        self.prompt_hcs_proof_arithmetic_valid = true;
+        if !self.prompt_hcs_collection_enabled {
             self.prompt_hcs_counts.clear();
             self.prompt_hcs_num_moe_layers = 0;
             self.prompt_hcs_num_experts_per_layer = 0;
@@ -9821,9 +10175,68 @@ impl PrefillEngine {
 
         self.prompt_hcs_num_moe_layers = num_moe_layers;
         self.prompt_hcs_num_experts_per_layer = num_experts;
-        let total = num_moe_layers.saturating_mul(num_experts);
+        self.prompt_hcs_expected_layers
+            .resize(num_moe_layers, false);
+        self.prompt_hcs_observed_layers
+            .resize(num_moe_layers, false);
+        self.prompt_hcs_expected_layer_route_count_sums
+            .resize(num_moe_layers, None);
+        self.prompt_hcs_observed_layer_route_count_sums
+            .resize(num_moe_layers, Some(0));
+        self.prompt_hcs_layer_record_calls.resize(num_moe_layers, 0);
+        for layer in &self.layer_weights {
+            let Some(moe_layer_idx) = layer.moe_layer_idx else {
+                continue;
+            };
+            let Some(expected) = self.prompt_hcs_expected_layers.get_mut(moe_layer_idx) else {
+                self.prompt_hcs_proof_arithmetic_valid = false;
+                continue;
+            };
+            if *expected {
+                self.prompt_hcs_proof_arithmetic_valid = false;
+                continue;
+            }
+            *expected = true;
+            let route_count_sum = u64::try_from(prompt_tokens).ok().and_then(|tokens| {
+                u64::try_from(layer.moe_topk)
+                    .ok()
+                    .and_then(|topk| tokens.checked_mul(topk))
+            });
+            let Some(expected_sum) = self
+                .prompt_hcs_expected_layer_route_count_sums
+                .get_mut(moe_layer_idx)
+            else {
+                self.prompt_hcs_proof_arithmetic_valid = false;
+                continue;
+            };
+            *expected_sum = route_count_sum;
+            if expected_sum.is_none() {
+                self.prompt_hcs_proof_arithmetic_valid = false;
+            }
+        }
+        self.prompt_hcs_expected_route_count_sum = self
+            .prompt_hcs_expected_layers
+            .iter()
+            .zip(self.prompt_hcs_expected_layer_route_count_sums.iter())
+            .try_fold(0u64, |sum, (&expected, &route_sum)| {
+                if expected {
+                    sum.checked_add(route_sum?)
+                } else if route_sum.is_none() {
+                    Some(sum)
+                } else {
+                    None
+                }
+            });
+        let Some(total) = num_moe_layers.checked_mul(num_experts) else {
+            self.prompt_hcs_counts.clear();
+            self.prompt_hcs_proof_arithmetic_valid = false;
+            return;
+        };
         self.prompt_hcs_counts.clear();
         self.prompt_hcs_counts.resize(total, 0);
+        if self.prompt_hcs_expected_route_count_sum.is_none() {
+            self.prompt_hcs_proof_arithmetic_valid = false;
+        }
         if prompt_hcs_log_enabled() {
             eprintln!(
                 "[PROMPT-HCS] prefill collection enabled prompt_tokens={} moe_layers={} experts_per_layer={}",
@@ -9840,38 +10253,117 @@ impl PrefillEngine {
         );
     }
 
+    fn set_prompt_hcs_expected_chunk_count(&mut self, chunk_count: usize) {
+        if !self.prompt_hcs_collection_enabled {
+            return;
+        }
+        if chunk_count == 0 {
+            self.prompt_hcs_expected_calls_per_layer = None;
+            self.prompt_hcs_proof_arithmetic_valid = false;
+        } else {
+            self.prompt_hcs_expected_calls_per_layer = Some(chunk_count);
+        }
+    }
+
     fn record_prompt_hcs_counts(
         &mut self,
         moe_layer_idx: Option<usize>,
         n_experts: usize,
         counts: &[i32],
     ) {
-        if !self.prompt_hcs_shadow_enabled {
+        if !self.prompt_hcs_collection_enabled {
             return;
         }
         let Some(mi) = moe_layer_idx else {
+            self.prompt_hcs_proof_arithmetic_valid = false;
             return;
         };
         if self.prompt_hcs_num_experts_per_layer == 0 || mi >= self.prompt_hcs_num_moe_layers {
+            self.prompt_hcs_proof_arithmetic_valid = false;
             return;
         }
         let stride = self.prompt_hcs_num_experts_per_layer;
-        let base = mi.saturating_mul(stride);
+        let Some(base) = mi.checked_mul(stride) else {
+            self.prompt_hcs_proof_arithmetic_valid = false;
+            return;
+        };
         let limit = n_experts.min(stride).min(counts.len());
-        if base + limit > self.prompt_hcs_counts.len() {
+        let Some(end) = base.checked_add(limit) else {
+            self.prompt_hcs_proof_arithmetic_valid = false;
+            return;
+        };
+        if end > self.prompt_hcs_counts.len() || limit != n_experts || counts.len() < n_experts {
+            self.prompt_hcs_proof_arithmetic_valid = false;
             return;
         }
+        self.prompt_hcs_record_calls = match self.prompt_hcs_record_calls.checked_add(1) {
+            Some(value) => value,
+            None => {
+                self.prompt_hcs_proof_arithmetic_valid = false;
+                return;
+            }
+        };
+        let Some(layer_record_calls) = self.prompt_hcs_layer_record_calls.get_mut(mi) else {
+            self.prompt_hcs_proof_arithmetic_valid = false;
+            return;
+        };
+        *layer_record_calls = match layer_record_calls.checked_add(1) {
+            Some(value) => value,
+            None => {
+                self.prompt_hcs_proof_arithmetic_valid = false;
+                return;
+            }
+        };
+        if let Some(seen) = self.prompt_hcs_observed_layers.get_mut(mi) {
+            *seen = true;
+        } else {
+            self.prompt_hcs_proof_arithmetic_valid = false;
+            return;
+        }
+        let mut recorded_sum = 0u64;
         for eid in 0..limit {
             let cnt = counts[eid];
-            if cnt > 0 {
-                self.prompt_hcs_counts[base + eid] =
-                    self.prompt_hcs_counts[base + eid].saturating_add(cnt as u64);
+            if cnt < 0 {
+                self.prompt_hcs_proof_arithmetic_valid = false;
+                return;
             }
+            if cnt > 0 {
+                let count = cnt as u64;
+                let index = base + eid;
+                let Some(updated) = self.prompt_hcs_counts[index].checked_add(count) else {
+                    self.prompt_hcs_proof_arithmetic_valid = false;
+                    return;
+                };
+                self.prompt_hcs_counts[index] = updated;
+                let Some(updated_sum) = recorded_sum.checked_add(count) else {
+                    self.prompt_hcs_proof_arithmetic_valid = false;
+                    return;
+                };
+                recorded_sum = updated_sum;
+            }
+        }
+        self.prompt_hcs_observed_route_count_sum = self
+            .prompt_hcs_observed_route_count_sum
+            .and_then(|sum| sum.checked_add(recorded_sum));
+        let Some(layer_route_count_sum) =
+            self.prompt_hcs_observed_layer_route_count_sums.get_mut(mi)
+        else {
+            self.prompt_hcs_proof_arithmetic_valid = false;
+            return;
+        };
+        *layer_route_count_sum =
+            layer_route_count_sum.and_then(|sum| sum.checked_add(recorded_sum));
+        if self.prompt_hcs_observed_route_count_sum.is_none() {
+            self.prompt_hcs_proof_arithmetic_valid = false;
+        }
+        if layer_route_count_sum.is_none() {
+            self.prompt_hcs_proof_arithmetic_valid = false;
         }
     }
 
     pub fn prompt_hcs_shadow_snapshot(&self) -> Option<(Vec<u64>, usize, usize, usize)> {
-        if !self.prompt_hcs_shadow_enabled
+        if !Self::prompt_hcs_shadow_install_env_enabled()
+            || !self.prompt_hcs_collection_enabled
             || self.prompt_hcs_counts.is_empty()
             || self.prompt_hcs_num_moe_layers == 0
             || self.prompt_hcs_num_experts_per_layer == 0
@@ -9884,6 +10376,29 @@ impl PrefillEngine {
             self.prompt_hcs_num_experts_per_layer,
             self.prompt_hcs_prompt_tokens,
         ))
+    }
+
+    pub fn prompt_hcs_proof_json(&self) -> serde_json::Value {
+        prompt_hcs_count_proof_json(PromptHcsProofInputs {
+            proof_gate_enabled: Self::prompt_hcs_proof_env_enabled(),
+            collection_enabled: self.prompt_hcs_collection_enabled,
+            reload_requested: Self::prompt_hcs_reload_env_enabled(),
+            decode_shadow_install_requested: Self::prompt_hcs_shadow_install_env_enabled(),
+            counts: &self.prompt_hcs_counts,
+            num_moe_layers: self.prompt_hcs_num_moe_layers,
+            num_experts_per_layer: self.prompt_hcs_num_experts_per_layer,
+            prompt_tokens: self.prompt_hcs_prompt_tokens,
+            expected_layers: &self.prompt_hcs_expected_layers,
+            observed_layers: &self.prompt_hcs_observed_layers,
+            expected_layer_route_count_sums: &self.prompt_hcs_expected_layer_route_count_sums,
+            observed_layer_route_count_sums: &self.prompt_hcs_observed_layer_route_count_sums,
+            layer_record_calls: &self.prompt_hcs_layer_record_calls,
+            expected_calls_per_layer: self.prompt_hcs_expected_calls_per_layer,
+            record_calls: self.prompt_hcs_record_calls,
+            expected_route_count_sum: self.prompt_hcs_expected_route_count_sum,
+            observed_route_count_sum: self.prompt_hcs_observed_route_count_sum,
+            arithmetic_valid: self.prompt_hcs_proof_arithmetic_valid,
+        })
     }
 
     fn reset_prefill_prescan_accuracy_measurement(
@@ -23958,7 +24473,18 @@ impl PrefillEngine {
             build_prefill_chunk_plan_at_boundary(total_m, max_chunk, capture_suffix_boundary)?
         };
         let num_chunks = chunk_plan.len();
+        self.set_prompt_hcs_expected_chunk_count(num_chunks);
         let chunk_size = chunk_plan.iter().copied().max().unwrap_or(0);
+        let reference_prefill_chunk_plan_proof = self.reference_debug_trace_enabled.then(|| {
+            prefill_chunk_plan_proof_json(
+                &chunk_plan,
+                total_m,
+                max_chunk,
+                capture_suffix_boundary,
+                sequence_start,
+                reset_sequence_state,
+            )
+        });
         self.reset_prefill_prescan_accuracy_measurement(total_m, &chunk_plan);
         if liveness_timing {
             prefill_liveness!(
@@ -27285,7 +27811,12 @@ impl PrefillEngine {
         }
 
         // 5. LM head + sampling
-        let first_token = self.lm_head_and_sample(m, temperature, suppress_tokens)?;
+        let first_token = self.lm_head_and_sample(
+            m,
+            temperature,
+            suppress_tokens,
+            reference_prefill_chunk_plan_proof.as_ref(),
+        )?;
         if trace_prefill_final && m > 0 {
             let last_pos = m - 1;
             let token_id = token_ids.last().copied().unwrap_or(0) as usize;
@@ -71222,6 +71753,7 @@ impl PrefillEngine {
         m: usize,
         temperature: f32,
         suppress_tokens: &[u32],
+        prefill_chunk_plan_proof: Option<&serde_json::Value>,
     ) -> Result<u32, String> {
         let cfg = &self.config;
         let h = cfg.hidden_size;
@@ -71318,9 +71850,13 @@ impl PrefillEngine {
             }
         }
         self.stream_sync()?;
+        let logits_after_lm_head_before_softcap_and_suppression = if debug_reference_trace {
+            Some(self.h_logits.clone())
+        } else {
+            None
+        };
         apply_logit_softcap_in_place(&mut self.h_logits, self.final_logit_softcap);
-
-        let logits_before_suppression = if debug_reference_trace {
+        let logits_after_softcap_before_suppression = if debug_reference_trace {
             Some(self.h_logits.clone())
         } else {
             None
@@ -71379,7 +71915,7 @@ impl PrefillEngine {
                         let margin_projection_trace = match (
                             margin_projection_target,
                             hidden_before_lm.as_ref(),
-                            logits_before_suppression.as_ref(),
+                            logits_after_softcap_before_suppression.as_ref(),
                         ) {
                             (Some(target), Some(hidden_bits), Some(logits)) => {
                                 Some(self.first_token_margin_projection_trace_json(
@@ -71397,6 +71933,8 @@ impl PrefillEngine {
                         };
                         self.last_reference_debug_trace = Some(serde_json::json!({
                             "available": true,
+                            "prefill_chunk_plan_proof": prefill_chunk_plan_proof.cloned()
+                                .unwrap_or_else(|| serde_json::json!({"available": false})),
                             "prefill_stage_snapshots": self.reference_prefill_stage_snapshots.borrow().clone(),
                             "prefill_buffer_identity": {
                                 "d_hidden_ptr": format!("0x{:x}", *self.scratch.d_hidden.device_ptr()),
@@ -71444,10 +71982,17 @@ impl PrefillEngine {
                                 "stream_sync_after_logits_download": true,
                                 "logits_download_api": "cuMemcpyDtoHAsync_v2",
                             },
-                            "logits_after_lm_head_before_suppression": logits_before_suppression
+                            "logits_after_lm_head_before_softcap_and_suppression": logits_after_lm_head_before_softcap_and_suppression
                                 .as_ref()
                                 .map(|logits| reference_lm_head_logit_trace_json(logits, v, i, 10))
                                 .unwrap_or_else(|| serde_json::json!({"available": false})),
+                            "logit_transform_boundary": {
+                                "raw_capture_before_softcap": true,
+                                "raw_capture_before_suppression": true,
+                                "final_logit_softcap": self.final_logit_softcap,
+                                "softcap_applied_after_raw_capture": self.final_logit_softcap > 0.0
+                                    && self.final_logit_softcap.is_finite(),
+                            },
                             "first_token_margin_projection": margin_projection_trace
                                 .unwrap_or_else(|| serde_json::json!({
                                     "available": false,
@@ -71473,7 +72018,7 @@ impl PrefillEngine {
             let margin_projection_trace = match (
                 margin_projection_target,
                 hidden_before_lm.as_ref(),
-                logits_before_suppression.as_ref(),
+                logits_after_softcap_before_suppression.as_ref(),
             ) {
                 (Some(target), Some(hidden_bits), Some(logits)) => {
                     Some(self.first_token_margin_projection_trace_json(
@@ -71491,6 +72036,8 @@ impl PrefillEngine {
             };
             self.last_reference_debug_trace = Some(serde_json::json!({
                 "available": true,
+                "prefill_chunk_plan_proof": prefill_chunk_plan_proof.cloned()
+                    .unwrap_or_else(|| serde_json::json!({"available": false})),
                 "prefill_stage_snapshots": self.reference_prefill_stage_snapshots.borrow().clone(),
                 "prefill_buffer_identity": {
                     "d_hidden_ptr": format!("0x{:x}", *self.scratch.d_hidden.device_ptr()),
@@ -71538,7 +72085,7 @@ impl PrefillEngine {
                     "stream_sync_after_logits_download": true,
                     "logits_download_api": "cuMemcpyDtoHAsync_v2",
                 },
-                "logits_after_lm_head_before_suppression": logits_before_suppression
+                "logits_after_lm_head_before_softcap_and_suppression": logits_after_lm_head_before_softcap_and_suppression
                     .as_ref()
                     .map(|logits| reference_lm_head_logit_trace_json(
                         logits,
@@ -71547,6 +72094,13 @@ impl PrefillEngine {
                         10,
                     ))
                     .unwrap_or_else(|| serde_json::json!({"available": false})),
+                "logit_transform_boundary": {
+                    "raw_capture_before_softcap": true,
+                    "raw_capture_before_suppression": true,
+                    "final_logit_softcap": self.final_logit_softcap,
+                    "softcap_applied_after_raw_capture": self.final_logit_softcap > 0.0
+                        && self.final_logit_softcap.is_finite(),
+                },
                 "first_token_margin_projection": margin_projection_trace
                     .unwrap_or_else(|| serde_json::json!({
                         "available": false,
@@ -74595,12 +75149,301 @@ Set KRASIS_NO_FLA=1 only if you explicitly want the slower custom LA path."
 #[cfg(test)]
 mod chunk_plan_tests {
     use super::{
-        build_balanced_prefill_chunk_plan, build_balanced_prefill_chunk_plan_at_boundary,
-        build_prefill_chunk_plan, build_prefill_chunk_plan_at_boundary,
-        portable_predicted_w1_requires_exact_resize, prefill_chunk_guard_prompt_tokens,
-        project_prefill_runtime_reserve_bytes, shared_moe_inter_scratch_elements,
+        apply_logit_softcap_in_place, build_balanced_prefill_chunk_plan,
+        build_balanced_prefill_chunk_plan_at_boundary, build_prefill_chunk_plan,
+        build_prefill_chunk_plan_at_boundary, portable_predicted_w1_requires_exact_resize,
+        prefill_chunk_guard_prompt_tokens, prefill_chunk_plan_proof_json,
+        project_prefill_runtime_reserve_bytes, prompt_hcs_count_proof_json,
+        reference_lm_head_logit_trace_json, shared_moe_inter_scratch_elements,
         stage_exact_export_launch_scalars, stage_exact_export_range, PortablePredictedW1Policy,
+        PrefillEngine, PromptHcsProofInputs,
     };
+
+    #[test]
+    fn prompt_hcs_boolean_parser_matches_runtime_default_semantics() {
+        for enabled in ["1", "true", "yes", "on", " TRUE "] {
+            assert!(PrefillEngine::prompt_hcs_enabled_default_from_value(
+                Ok(Some(enabled)),
+                false,
+            ));
+        }
+        for disabled in ["0", "false", "no", "off", " OFF "] {
+            assert!(!PrefillEngine::prompt_hcs_enabled_default_from_value(
+                Ok(Some(disabled)),
+                true,
+            ));
+        }
+        for default in [false, true] {
+            assert_eq!(
+                PrefillEngine::prompt_hcs_enabled_default_from_value(Ok(Some("invalid")), default,),
+                default,
+            );
+            assert_eq!(
+                PrefillEngine::prompt_hcs_enabled_default_from_value(Ok(None), default),
+                default,
+            );
+            assert_eq!(
+                PrefillEngine::prompt_hcs_enabled_default_from_value(Err(()), default),
+                default,
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_plan_proof_uses_fixed_encoding_and_checks_every_invariant() {
+        let proof = prefill_chunk_plan_proof_json(&[4, 6], 10, 6, Some(4), 0, true);
+        assert_eq!(proof["available"], true);
+        assert_eq!(proof["logical_prompt_tokens"], 10);
+        assert_eq!(
+            proof["sha256_le_u64"],
+            "8525507d3b3dbad0602204154227b284048679c49673e0c0fd3e9833bdb4a9e0"
+        );
+
+        let continuation = prefill_chunk_plan_proof_json(&[4, 6], 10, 6, Some(4), 100, false);
+        assert_eq!(continuation["available"], true);
+        assert_eq!(continuation["logical_prompt_tokens"], 110);
+        assert_eq!(continuation["state_mode"], "continuation");
+
+        assert_eq!(
+            prefill_chunk_plan_proof_json(&[4, 0, 6], 10, 6, Some(4), 0, true)["available"],
+            false
+        );
+        assert_eq!(
+            prefill_chunk_plan_proof_json(&[4, 7], 11, 6, Some(4), 0, true)["available"],
+            false
+        );
+        assert_eq!(
+            prefill_chunk_plan_proof_json(&[4, 6], 11, 6, Some(4), 0, true)["available"],
+            false
+        );
+        assert_eq!(
+            prefill_chunk_plan_proof_json(&[4, 6], 10, 6, Some(5), 0, true)["available"],
+            false
+        );
+        assert_eq!(
+            prefill_chunk_plan_proof_json(&[4, 6], 10, 6, Some(4), 100, true)["available"],
+            false
+        );
+    }
+
+    #[test]
+    fn raw_prefill_logit_proof_hashes_pre_suppression_f32_bits() {
+        let raw = [1.0f32, -2.5f32, 0.0f32, 3.25f32];
+        let proof = reference_lm_head_logit_trace_json(&raw, raw.len(), 3, 4);
+        assert_eq!(proof["available"], true);
+        assert_eq!(proof["finite_count"], 4);
+        assert_eq!(
+            proof["sha256_le_f32_bits"],
+            "685b7ddd99d5c6487e584654c8e84ceb0d9b47eea2d0eaa7cd4c1aed901ca064"
+        );
+
+        let suppressed = [1.0f32, -10_000.0f32, 0.0f32, 3.25f32];
+        let suppressed_proof =
+            reference_lm_head_logit_trace_json(&suppressed, suppressed.len(), 3, 4);
+        assert_ne!(
+            proof["sha256_le_f32_bits"],
+            suppressed_proof["sha256_le_f32_bits"]
+        );
+
+        let raw_before_softcap = [10.0f32, -5.0f32, 0.0f32, 3.25f32];
+        let raw_before_softcap_proof =
+            reference_lm_head_logit_trace_json(&raw_before_softcap, raw_before_softcap.len(), 3, 4);
+        let mut after_softcap = raw_before_softcap;
+        apply_logit_softcap_in_place(&mut after_softcap, 2.0);
+        let after_softcap_proof =
+            reference_lm_head_logit_trace_json(&after_softcap, after_softcap.len(), 3, 4);
+        assert_eq!(raw_before_softcap[0], 10.0);
+        assert!(after_softcap[0] < 2.0);
+        assert_ne!(
+            raw_before_softcap_proof["sha256_le_f32_bits"],
+            after_softcap_proof["sha256_le_f32_bits"]
+        );
+    }
+
+    #[test]
+    fn prompt_hcs_proof_requires_exact_layer_and_route_coverage() {
+        let counts = [1u64, 2, 3, 4];
+        let expected_layers = [true, true];
+        let observed_layers = [true, true];
+        let expected_layer_route_count_sums = [Some(3), Some(7)];
+        let observed_layer_route_count_sums = [Some(3), Some(7)];
+        let layer_record_calls = [1usize, 1];
+        let valid = prompt_hcs_count_proof_json(PromptHcsProofInputs {
+            proof_gate_enabled: true,
+            collection_enabled: true,
+            reload_requested: false,
+            decode_shadow_install_requested: false,
+            counts: &counts,
+            num_moe_layers: 2,
+            num_experts_per_layer: 2,
+            prompt_tokens: 5,
+            expected_layers: &expected_layers,
+            observed_layers: &observed_layers,
+            expected_layer_route_count_sums: &expected_layer_route_count_sums,
+            observed_layer_route_count_sums: &observed_layer_route_count_sums,
+            layer_record_calls: &layer_record_calls,
+            expected_calls_per_layer: Some(1),
+            record_calls: 2,
+            expected_route_count_sum: Some(10),
+            observed_route_count_sum: Some(10),
+            arithmetic_valid: true,
+        });
+        assert_eq!(valid["available"], true);
+        assert_eq!(valid["layer_coverage_complete"], true);
+        assert_eq!(valid["routed_count_coverage_complete"], true);
+        assert_eq!(
+            valid["count_sha256_le_u64"],
+            "73e200e2b048c86d4e8c86b86bf62bbda84c7384e34e250b01aa30ab29d234a4"
+        );
+        assert_eq!(
+            valid["expected_layer_bitmap_sha256"],
+            "9dcf97a184f32623d11a73124ceb99a5709b083721e878a16d78f596718ba7b2"
+        );
+        assert_eq!(
+            valid["expected_per_layer_route_sum_sha256"],
+            "4a2aad355d42efdaa348956596b1b864a4032250cebc47abc30de4d30b69ad03"
+        );
+        assert_eq!(
+            valid["observed_per_layer_route_sum_sha256"],
+            "4a2aad355d42efdaa348956596b1b864a4032250cebc47abc30de4d30b69ad03"
+        );
+        assert_eq!(
+            valid["per_layer_record_calls_sha256"],
+            "814dd7b9784d57c15b9c2972e9b4fd6cf7e164f8162a934bdb2452a413dab1f7"
+        );
+
+        let incomplete_layers = [true, false];
+        let incomplete = prompt_hcs_count_proof_json(PromptHcsProofInputs {
+            proof_gate_enabled: true,
+            collection_enabled: true,
+            reload_requested: false,
+            decode_shadow_install_requested: false,
+            counts: &counts,
+            num_moe_layers: 2,
+            num_experts_per_layer: 2,
+            prompt_tokens: 5,
+            expected_layers: &expected_layers,
+            observed_layers: &incomplete_layers,
+            expected_layer_route_count_sums: &expected_layer_route_count_sums,
+            observed_layer_route_count_sums: &observed_layer_route_count_sums,
+            layer_record_calls: &layer_record_calls,
+            expected_calls_per_layer: Some(1),
+            record_calls: 2,
+            expected_route_count_sum: Some(10),
+            observed_route_count_sum: Some(10),
+            arithmetic_valid: true,
+        });
+        assert_eq!(incomplete["available"], false);
+        assert_eq!(incomplete["reason"], "incomplete_moe_layer_coverage");
+        assert!(incomplete["count_sha256_le_u64"].is_null());
+
+        let route_mismatch = prompt_hcs_count_proof_json(PromptHcsProofInputs {
+            proof_gate_enabled: true,
+            collection_enabled: true,
+            reload_requested: false,
+            decode_shadow_install_requested: false,
+            counts: &counts,
+            num_moe_layers: 2,
+            num_experts_per_layer: 2,
+            prompt_tokens: 5,
+            expected_layers: &expected_layers,
+            observed_layers: &observed_layers,
+            expected_layer_route_count_sums: &expected_layer_route_count_sums,
+            observed_layer_route_count_sums: &observed_layer_route_count_sums,
+            layer_record_calls: &layer_record_calls,
+            expected_calls_per_layer: Some(1),
+            record_calls: 2,
+            expected_route_count_sum: Some(10),
+            observed_route_count_sum: Some(9),
+            arithmetic_valid: true,
+        });
+        assert_eq!(route_mismatch["available"], false);
+        assert_eq!(route_mismatch["reason"], "routed_count_sum_mismatch");
+
+        let compensated_layer_route_count_sums = [Some(2), Some(8)];
+        let cross_layer_compensation = prompt_hcs_count_proof_json(PromptHcsProofInputs {
+            proof_gate_enabled: true,
+            collection_enabled: true,
+            reload_requested: false,
+            decode_shadow_install_requested: false,
+            counts: &counts,
+            num_moe_layers: 2,
+            num_experts_per_layer: 2,
+            prompt_tokens: 5,
+            expected_layers: &expected_layers,
+            observed_layers: &observed_layers,
+            expected_layer_route_count_sums: &expected_layer_route_count_sums,
+            observed_layer_route_count_sums: &compensated_layer_route_count_sums,
+            layer_record_calls: &layer_record_calls,
+            expected_calls_per_layer: Some(1),
+            record_calls: 2,
+            expected_route_count_sum: Some(10),
+            observed_route_count_sum: Some(10),
+            arithmetic_valid: true,
+        });
+        assert_eq!(cross_layer_compensation["available"], false);
+        assert_eq!(
+            cross_layer_compensation["reason"],
+            "per_layer_route_count_mismatch"
+        );
+        assert_ne!(
+            cross_layer_compensation["expected_per_layer_route_sum_sha256"],
+            cross_layer_compensation["observed_per_layer_route_sum_sha256"]
+        );
+
+        let omitted_and_duplicated_layer_calls = [0usize, 2];
+        let wrong_chunk_calls = prompt_hcs_count_proof_json(PromptHcsProofInputs {
+            proof_gate_enabled: true,
+            collection_enabled: true,
+            reload_requested: false,
+            decode_shadow_install_requested: false,
+            counts: &counts,
+            num_moe_layers: 2,
+            num_experts_per_layer: 2,
+            prompt_tokens: 5,
+            expected_layers: &expected_layers,
+            observed_layers: &observed_layers,
+            expected_layer_route_count_sums: &expected_layer_route_count_sums,
+            observed_layer_route_count_sums: &observed_layer_route_count_sums,
+            layer_record_calls: &omitted_and_duplicated_layer_calls,
+            expected_calls_per_layer: Some(1),
+            record_calls: 2,
+            expected_route_count_sum: Some(10),
+            observed_route_count_sum: Some(10),
+            arithmetic_valid: true,
+        });
+        assert_eq!(wrong_chunk_calls["available"], false);
+        assert_eq!(
+            wrong_chunk_calls["reason"],
+            "per_layer_record_call_mismatch"
+        );
+
+        let wrong_expected_chunk_count = prompt_hcs_count_proof_json(PromptHcsProofInputs {
+            proof_gate_enabled: true,
+            collection_enabled: true,
+            reload_requested: false,
+            decode_shadow_install_requested: false,
+            counts: &counts,
+            num_moe_layers: 2,
+            num_experts_per_layer: 2,
+            prompt_tokens: 5,
+            expected_layers: &expected_layers,
+            observed_layers: &observed_layers,
+            expected_layer_route_count_sums: &expected_layer_route_count_sums,
+            observed_layer_route_count_sums: &observed_layer_route_count_sums,
+            layer_record_calls: &layer_record_calls,
+            expected_calls_per_layer: Some(2),
+            record_calls: 2,
+            expected_route_count_sum: Some(10),
+            observed_route_count_sum: Some(10),
+            arithmetic_valid: true,
+        });
+        assert_eq!(wrong_expected_chunk_count["available"], false);
+        assert_eq!(
+            wrong_expected_chunk_count["reason"],
+            "per_layer_record_call_mismatch"
+        );
+    }
 
     #[test]
     fn uses_single_chunk_when_prompt_fits() {
