@@ -9038,10 +9038,11 @@ pub(crate) mod dsa_registration_tests {
         validate_dsa_owner_weight_contract, validate_dsa_runtime_registration,
         validate_dspark_residency_contract, validate_stream_probe_outcome, CudaEvent, CudaStream,
         DsaGraphScoreBackend, DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds,
-        DsparkResidencyMode, DsparkTargetCacheRowMapping, DsparkVerificationPolicy, ExpertDataPtr,
-        GpuAttnConfig, GpuDecodeStore, GpuWeight, GraphW13Path, HqqStageAsyncCopyMode,
-        PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert, PendingPeerDispatch,
-        RouteLocalityGlobalLruState, DSA_TOPK_RADIX_THREADS, DSPARK_F5_ARTIFACT_NAMES, MODULE_NAME,
+        DsparkResidencyMode, DsparkTargetCacheRowMapping, DsparkTargetWidthTimings,
+        DsparkVerificationPolicy, ExpertDataPtr, GpuAttnConfig, GpuDecodeStore, GpuWeight,
+        GraphW13Path, HqqStageAsyncCopyMode, PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert,
+        PendingPeerDispatch, RouteLocalityGlobalLruState, DSA_TOPK_RADIX_THREADS,
+        DSPARK_F5_ARTIFACT_NAMES, MODULE_NAME,
     };
 
     static DSA_CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -9251,6 +9252,125 @@ pub(crate) mod dsa_registration_tests {
         assert!(select_dspark_diagnostic_verify_rows(2, 0, 2).is_err());
         assert!(select_dspark_diagnostic_verify_rows(2, 5, 0).is_err());
         assert!(select_dspark_diagnostic_verify_rows(1, 5, 0).is_err());
+    }
+
+    #[test]
+    fn dspark_target_width_timing_commits_only_complete_actual_width_rounds() {
+        let mut timings = DsparkTargetWidthTimings::new(3).unwrap();
+        timings.begin(2).unwrap();
+        {
+            let pending = timings.pending_mut(2).unwrap();
+            pending.transaction_save_seconds = 0.001;
+            pending.target_setup_seconds = 0.002;
+            pending.target_attention_route_seconds = 0.003;
+            pending.target_moe_seconds = 0.004;
+            pending.target_hc_capture_seconds = 0.005;
+            pending.target_head_seconds = 0.006;
+            pending.transaction_restore_seconds = 0.007;
+            pending.context_commit_seconds = 0.008;
+        }
+        timings.finish(2, 0.05, 1, 1).unwrap();
+
+        let status = timings.status_json();
+        assert_eq!(status["schema"], "krasis_dspark_target_width_timing_v1");
+        assert_eq!(status["timing_intrusive"], true);
+        assert_eq!(status["pending_round"], false);
+        assert_eq!(status["widths"].as_array().unwrap().len(), 3);
+        assert_eq!(status["widths"][0]["rounds"], 0);
+        assert_eq!(status["widths"][1]["rows"], 2);
+        assert_eq!(status["widths"][1]["rounds"], 1);
+        assert_eq!(status["widths"][1]["emitted_tokens"], 1);
+        assert_eq!(status["widths"][1]["rollback_operations"], 1);
+        assert_eq!(status["widths"][1]["verify_service_seconds"], 0.05);
+        assert_eq!(status["widths"][1]["target_moe_seconds"], 0.004);
+        assert_eq!(status["widths"][2]["rounds"], 0);
+
+        timings.reset();
+        let reset = timings.status_json();
+        assert_eq!(reset["pending_round"], false);
+        assert!(reset["widths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|width| width["rounds"] == 0));
+    }
+
+    #[test]
+    fn dspark_target_width_timing_rejects_partial_mismatched_and_invalid_rounds() {
+        assert!(DsparkTargetWidthTimings::new(0).is_err());
+
+        let mut partial = DsparkTargetWidthTimings::new(3).unwrap();
+        assert!(partial.begin(0).is_err());
+        assert!(partial.begin(4).is_err());
+        partial.begin(3).unwrap();
+        partial.pending_mut(3).unwrap().target_head_seconds = 0.01;
+        assert!(partial.begin(3).is_err());
+        let pending = partial.status_json();
+        assert_eq!(pending["pending_round"], true);
+        assert!(pending["widths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|width| width["rounds"] == 0));
+        assert!(partial.finish(2, 0.02, 1, 0).is_err());
+        assert!(partial.status_json()["widths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|width| width["rounds"] == 0));
+
+        let mut invalid = DsparkTargetWidthTimings::new(3).unwrap();
+        invalid.begin(1).unwrap();
+        assert!(invalid.finish(1, f64::NAN, 1, 0).is_err());
+        assert_eq!(invalid.status_json()["widths"][0]["rounds"], 0);
+
+        for emitted_tokens in [0, 3] {
+            let mut invalid = DsparkTargetWidthTimings::new(3).unwrap();
+            invalid.begin(2).unwrap();
+            assert!(invalid.finish(2, 0.01, emitted_tokens, 0).is_err());
+            assert_eq!(invalid.status_json()["widths"][1]["rounds"], 0);
+        }
+    }
+
+    #[test]
+    fn dspark_target_width_timing_keeps_mixed_width_buckets_independent() {
+        let mut timings = DsparkTargetWidthTimings::new(3).unwrap();
+        timings.begin(3).unwrap();
+        timings.pending_mut(3).unwrap().target_moe_seconds = 0.03;
+        timings.finish(3, 0.10, 3, 0).unwrap();
+
+        timings.begin(1).unwrap();
+        timings.pending_mut(1).unwrap().target_moe_seconds = 0.01;
+        timings.finish(1, 0.04, 1, 0).unwrap();
+
+        timings.begin(3).unwrap();
+        timings.pending_mut(3).unwrap().target_moe_seconds = 0.04;
+        timings.finish(3, 0.20, 1, 1).unwrap();
+
+        let status = timings.status_json();
+        assert_eq!(status["widths"][0]["rounds"], 1);
+        assert_eq!(status["widths"][0]["emitted_tokens"], 1);
+        assert_eq!(status["widths"][0]["target_moe_seconds"], 0.01);
+        assert_eq!(status["widths"][1]["rounds"], 0);
+        assert_eq!(status["widths"][2]["rounds"], 2);
+        assert_eq!(status["widths"][2]["emitted_tokens"], 4);
+        assert_eq!(status["widths"][2]["rollback_operations"], 1);
+        assert!(
+            (status["widths"][2]["verify_service_seconds"]
+                .as_f64()
+                .unwrap()
+                - 0.30)
+                .abs()
+                < 1e-12
+        );
+        assert!((status["widths"][2]["target_moe_seconds"].as_f64().unwrap() - 0.07).abs() < 1e-12);
+        let total_rounds: u64 = status["widths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|width| width["rounds"].as_u64().unwrap())
+            .sum();
+        assert_eq!(total_rounds, 3);
     }
 
     #[test]
@@ -20963,6 +21083,7 @@ struct DsparkRuntime {
     batch_head_seconds: f64,
     batch_restore_seconds: f64,
     context_commit_seconds: f64,
+    target_width_timings: DsparkTargetWidthTimings,
     verification_policy: DsparkVerificationPolicy,
     target_state_backups: Vec<DsparkTargetStateBackup>,
     target_cache_row_backups: Vec<DsparkTargetCacheRowBackup>,
@@ -20975,6 +21096,194 @@ struct DsparkWidthMeasurement {
     rounds: u64,
     proposal_seconds: f64,
     verification_seconds: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DsparkTargetWidthTiming {
+    rounds: u64,
+    emitted_tokens: u64,
+    rollback_operations: u64,
+    verify_service_seconds: f64,
+    transaction_save_seconds: f64,
+    target_setup_seconds: f64,
+    target_attention_route_seconds: f64,
+    target_moe_seconds: f64,
+    target_hc_capture_seconds: f64,
+    target_head_seconds: f64,
+    transaction_restore_seconds: f64,
+    context_commit_seconds: f64,
+}
+
+impl DsparkTargetWidthTiming {
+    fn validate(&self) -> Result<(), String> {
+        let seconds = [
+            self.verify_service_seconds,
+            self.transaction_save_seconds,
+            self.target_setup_seconds,
+            self.target_attention_route_seconds,
+            self.target_moe_seconds,
+            self.target_hc_capture_seconds,
+            self.target_head_seconds,
+            self.transaction_restore_seconds,
+            self.context_commit_seconds,
+        ];
+        if seconds
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err("D-Spark target-width timing contains invalid seconds".to_string());
+        }
+        Ok(())
+    }
+
+    fn checked_add(&mut self, other: &Self) -> Result<(), String> {
+        self.validate()?;
+        other.validate()?;
+        let mut merged = self.clone();
+        merged.rounds = merged
+            .rounds
+            .checked_add(other.rounds)
+            .ok_or_else(|| "D-Spark target-width round counter overflow".to_string())?;
+        merged.emitted_tokens = merged
+            .emitted_tokens
+            .checked_add(other.emitted_tokens)
+            .ok_or_else(|| "D-Spark target-width emitted-token counter overflow".to_string())?;
+        merged.rollback_operations = merged
+            .rollback_operations
+            .checked_add(other.rollback_operations)
+            .ok_or_else(|| "D-Spark target-width rollback counter overflow".to_string())?;
+        merged.verify_service_seconds += other.verify_service_seconds;
+        merged.transaction_save_seconds += other.transaction_save_seconds;
+        merged.target_setup_seconds += other.target_setup_seconds;
+        merged.target_attention_route_seconds += other.target_attention_route_seconds;
+        merged.target_moe_seconds += other.target_moe_seconds;
+        merged.target_hc_capture_seconds += other.target_hc_capture_seconds;
+        merged.target_head_seconds += other.target_head_seconds;
+        merged.transaction_restore_seconds += other.transaction_restore_seconds;
+        merged.context_commit_seconds += other.context_commit_seconds;
+        merged.validate()?;
+        *self = merged;
+        Ok(())
+    }
+
+    fn status_json(&self, rows: usize) -> serde_json::Value {
+        serde_json::json!({
+            "rows": rows,
+            "rounds": self.rounds,
+            "emitted_tokens": self.emitted_tokens,
+            "rollback_operations": self.rollback_operations,
+            "verify_service_seconds": self.verify_service_seconds,
+            "transaction_save_seconds": self.transaction_save_seconds,
+            "target_setup_seconds": self.target_setup_seconds,
+            "target_attention_route_seconds": self.target_attention_route_seconds,
+            "target_moe_seconds": self.target_moe_seconds,
+            "target_hc_capture_seconds": self.target_hc_capture_seconds,
+            "target_head_seconds": self.target_head_seconds,
+            "transaction_restore_seconds": self.transaction_restore_seconds,
+            "context_commit_seconds": self.context_commit_seconds,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DsparkTargetWidthTimings {
+    buckets: Vec<DsparkTargetWidthTiming>,
+    pending: Option<(usize, DsparkTargetWidthTiming)>,
+}
+
+impl DsparkTargetWidthTimings {
+    fn new(width_count: usize) -> Result<Self, String> {
+        if width_count == 0 {
+            return Err("D-Spark target-width timing requires a positive width count".to_string());
+        }
+        Ok(Self {
+            buckets: vec![DsparkTargetWidthTiming::default(); width_count],
+            pending: None,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.buckets.fill(DsparkTargetWidthTiming::default());
+        self.pending = None;
+    }
+
+    fn begin(&mut self, rows: usize) -> Result<(), String> {
+        if rows == 0 || rows > self.buckets.len() {
+            return Err(format!(
+                "D-Spark target-width timing cannot begin row width {rows}/{}",
+                self.buckets.len(),
+            ));
+        }
+        if self.pending.is_some() {
+            return Err("D-Spark target-width timing already has a pending round".to_string());
+        }
+        self.pending = Some((rows, DsparkTargetWidthTiming::default()));
+        Ok(())
+    }
+
+    fn pending_mut(&mut self, rows: usize) -> Result<&mut DsparkTargetWidthTiming, String> {
+        let (pending_rows, timing) = self
+            .pending
+            .as_mut()
+            .ok_or_else(|| "D-Spark target-width timing has no pending round".to_string())?;
+        if *pending_rows != rows {
+            return Err(format!(
+                "D-Spark target-width timing pending width {pending_rows}/{rows}"
+            ));
+        }
+        Ok(timing)
+    }
+
+    fn finish(
+        &mut self,
+        rows: usize,
+        verify_service_seconds: f64,
+        emitted_tokens: usize,
+        rollback_operations: u64,
+    ) -> Result<(), String> {
+        if !verify_service_seconds.is_finite() || verify_service_seconds < 0.0 {
+            return Err("D-Spark target-width verify service time is invalid".to_string());
+        }
+        if emitted_tokens == 0 || emitted_tokens > rows {
+            return Err(format!(
+                "D-Spark target-width emitted-token count {emitted_tokens}/{rows}"
+            ));
+        }
+        let (pending_rows, mut timing) = self
+            .pending
+            .take()
+            .ok_or_else(|| "D-Spark target-width timing has no round to finish".to_string())?;
+        if pending_rows != rows {
+            return Err(format!(
+                "D-Spark target-width timing finished width {pending_rows}/{rows}"
+            ));
+        }
+        timing.rounds = 1;
+        timing.verify_service_seconds = verify_service_seconds;
+        timing.emitted_tokens = u64::try_from(emitted_tokens)
+            .map_err(|_| "D-Spark target-width emitted-token count exceeds u64".to_string())?;
+        timing.rollback_operations = rollback_operations;
+        timing.validate()?;
+        let bucket_count = self.buckets.len();
+        let bucket = self.buckets.get_mut(rows - 1).ok_or_else(|| {
+            format!("D-Spark target-width timing has no bucket {rows}/{bucket_count}")
+        })?;
+        bucket.checked_add(&timing)
+    }
+
+    fn status_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "krasis_dspark_target_width_timing_v1",
+            "timing_intrusive": true,
+            "pending_round": self.pending.is_some(),
+            "widths": self
+                .buckets
+                .iter()
+                .enumerate()
+                .map(|(index, timing)| timing.status_json(index + 1))
+                .collect::<Vec<_>>(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -37769,6 +38078,13 @@ impl GpuDecodeStore {
         let stage_router_registered = vec![false; stage_count];
         let verification_policy = DsparkVerificationPolicy::new(block_size)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let target_width_timings =
+            DsparkTargetWidthTimings::new(block_size.checked_add(1).ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err(
+                    "D-Spark target-width timing capacity overflow",
+                )
+            })?)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         self.dspark = Some(DsparkRuntime {
             mode,
             target_layer_ids,
@@ -37807,6 +38123,7 @@ impl GpuDecodeStore {
             batch_head_seconds: 0.0,
             batch_restore_seconds: 0.0,
             context_commit_seconds: 0.0,
+            target_width_timings,
             verification_policy,
             target_state_backups: Vec::new(),
             target_cache_row_backups: Vec::new(),
@@ -71060,8 +71377,14 @@ impl GpuDecodeStore {
                 "initial HC state",
             )?;
         }
-        runtime.batch_setup_seconds +=
-            self.dspark_timing_checkpoint(setup_started, "target batch setup")?;
+        let setup_seconds = self.dspark_timing_checkpoint(setup_started, "target batch setup")?;
+        runtime.batch_setup_seconds += setup_seconds;
+        if timing {
+            runtime
+                .target_width_timings
+                .pending_mut(batch_size)?
+                .target_setup_seconds += setup_seconds;
+        }
 
         for layer_idx in 0..graph.num_layers {
             let hc = graph.layers[layer_idx]
@@ -71140,10 +71463,17 @@ impl GpuDecodeStore {
                     "FFN HC combination weights",
                 )?;
             }
-            runtime.batch_attention_route_seconds += self.dspark_timing_checkpoint(
+            let attention_route_seconds = self.dspark_timing_checkpoint(
                 attention_route_started,
                 &format!("target layer {layer_idx} attention/routing"),
             )?;
+            runtime.batch_attention_route_seconds += attention_route_seconds;
+            if timing {
+                runtime
+                    .target_width_timings
+                    .pending_mut(batch_size)?
+                    .target_attention_route_seconds += attention_route_seconds;
+            }
 
             let moe_started = timing.then(std::time::Instant::now);
             let active_batch =
@@ -71153,10 +71483,17 @@ impl GpuDecodeStore {
                     "D-Spark target batch was truncated at layer {layer_idx}: {active_batch}/{batch_size}"
                 ));
             }
-            runtime.batch_moe_seconds += self.dspark_timing_checkpoint(
+            let moe_seconds = self.dspark_timing_checkpoint(
                 moe_started,
                 &format!("target layer {layer_idx} batched MoE"),
             )?;
+            runtime.batch_moe_seconds += moe_seconds;
+            if timing {
+                runtime
+                    .target_width_timings
+                    .pending_mut(batch_size)?
+                    .target_moe_seconds += moe_seconds;
+            }
             let hc_commit_started = timing.then(std::time::Instant::now);
             for (batch_idx, &position) in positions.iter().enumerate() {
                 let state_ptr =
@@ -71190,10 +71527,17 @@ impl GpuDecodeStore {
                     position_ptr,
                 )?;
             }
-            runtime.batch_hc_commit_seconds += self.dspark_timing_checkpoint(
+            let hc_capture_seconds = self.dspark_timing_checkpoint(
                 hc_commit_started,
                 &format!("target layer {layer_idx} HC/context capture"),
             )?;
+            runtime.batch_hc_commit_seconds += hc_capture_seconds;
+            if timing {
+                runtime
+                    .target_width_timings
+                    .pending_mut(batch_size)?
+                    .target_hc_capture_seconds += hc_capture_seconds;
+            }
             if layer_trace_enabled {
                 let ffn_input = dspark_trace_bf16_rows(
                     d_batch_hidden_ptr,
@@ -71587,8 +71931,14 @@ impl GpuDecodeStore {
                 final_logits,
             );
         }
-        runtime.batch_head_seconds +=
-            self.dspark_timing_checkpoint(head_started, "target batch head")?;
+        let head_seconds = self.dspark_timing_checkpoint(head_started, "target batch head")?;
+        runtime.batch_head_seconds += head_seconds;
+        if timing {
+            runtime
+                .target_width_timings
+                .pending_mut(batch_size)?
+                .target_head_seconds += head_seconds;
+        }
         Ok(batch_size)
     }
 
@@ -77861,6 +78211,7 @@ impl GpuDecodeStore {
             runtime.batch_head_seconds = 0.0;
             runtime.batch_restore_seconds = 0.0;
             runtime.context_commit_seconds = 0.0;
+            runtime.target_width_timings.reset();
         }
 
         // Reset draft model KV cache for speculative decode
@@ -78109,6 +78460,23 @@ impl GpuDecodeStore {
                     }
                 };
 
+                if dspark_timing {
+                    let begin_result = self
+                        .dspark
+                        .as_mut()
+                        .ok_or_else(|| {
+                            "D-Spark runtime disappeared before target timing".to_string()
+                        })
+                        .and_then(|runtime| runtime.target_width_timings.begin(verify_count));
+                    if let Err(error) = begin_result {
+                        let failure =
+                            format!("D-Spark target-width timing could not begin: {error}");
+                        log::error!("gpu_generate_stream: {}", failure);
+                        self.last_stream_failure = Some(failure);
+                        break;
+                    }
+                }
+
                 let verify_started = dspark_service_timing.then(Instant::now);
                 let save_started = dspark_timing.then(Instant::now);
                 let save_result = self
@@ -78139,6 +78507,19 @@ impl GpuDecodeStore {
                     };
                     if let Some(runtime) = self.dspark.as_mut() {
                         runtime.batch_save_seconds += save_seconds;
+                        if let Err(error) = runtime
+                            .target_width_timings
+                            .pending_mut(verify_count)
+                            .map(|timing| {
+                                timing.transaction_save_seconds += save_seconds;
+                            })
+                        {
+                            let failure =
+                                format!("D-Spark target-width save timing failed: {error}");
+                            log::error!("gpu_generate_stream: {}", failure);
+                            self.last_stream_failure = Some(failure);
+                            break;
+                        }
                     }
                 }
 
@@ -78394,6 +78775,19 @@ impl GpuDecodeStore {
                         };
                         if let Some(runtime) = self.dspark.as_mut() {
                             runtime.batch_restore_seconds += restore_seconds;
+                            if let Err(error) = runtime
+                                .target_width_timings
+                                .pending_mut(verify_count)
+                                .map(|timing| {
+                                    timing.transaction_restore_seconds += restore_seconds;
+                                })
+                            {
+                                let failure =
+                                    format!("D-Spark target-width restore timing failed: {error}");
+                                log::error!("gpu_generate_stream: {}", failure);
+                                self.last_stream_failure = Some(failure);
+                                break;
+                            }
                         }
                     }
                     rollback_operations = rollback_operations.saturating_add(1);
@@ -78506,6 +78900,20 @@ impl GpuDecodeStore {
                     if dspark_timing {
                         if let Some(runtime) = self.dspark.as_mut() {
                             runtime.batch_restore_seconds += correction_seconds;
+                            if let Err(error) = runtime
+                                .target_width_timings
+                                .pending_mut(verify_count)
+                                .map(|timing| {
+                                    timing.transaction_restore_seconds += correction_seconds;
+                                })
+                            {
+                                let failure = format!(
+                                    "D-Spark target-width callback restore timing failed: {error}"
+                                );
+                                log::error!("gpu_generate_stream: {}", failure);
+                                self.last_stream_failure = Some(failure);
+                                break;
+                            }
                         }
                     }
                     rollback_operations = rollback_operations.saturating_add(1);
@@ -78537,11 +78945,39 @@ impl GpuDecodeStore {
                     };
                     if let Some(runtime) = self.dspark.as_mut() {
                         runtime.context_commit_seconds += context_commit_seconds;
+                        if let Err(error) = runtime
+                            .target_width_timings
+                            .pending_mut(verify_count)
+                            .map(|timing| {
+                                timing.context_commit_seconds += context_commit_seconds;
+                            })
+                        {
+                            let failure = format!(
+                                "D-Spark target-width context-commit timing failed: {error}"
+                            );
+                            log::error!("gpu_generate_stream: {}", failure);
+                            self.last_stream_failure = Some(failure);
+                            break;
+                        }
                     }
                 }
                 if let Some(runtime) = self.dspark.as_mut() {
                     verify_seconds =
                         verify_started.map_or(0.0, |started| started.elapsed().as_secs_f64());
+                    if dspark_timing {
+                        if let Err(error) = runtime.target_width_timings.finish(
+                            verify_count,
+                            verify_seconds,
+                            actual_count,
+                            rollback_operations,
+                        ) {
+                            let failure =
+                                format!("D-Spark target-width timing could not finish: {error}");
+                            log::error!("gpu_generate_stream: {}", failure);
+                            self.last_stream_failure = Some(failure);
+                            break;
+                        }
+                    }
                     runtime.batch_verify_rounds = runtime.batch_verify_rounds.saturating_add(1);
                     runtime.batch_transaction_rollbacks = runtime
                         .batch_transaction_rollbacks
@@ -79607,6 +80043,17 @@ impl GpuDecodeStore {
                 );
             }
             if dspark_timing_enabled {
+                let target_width_timing = runtime.target_width_timings.status_json();
+                eprintln!(
+                    "D-SPARK TARGET WIDTH TIMING mode={} status={}",
+                    runtime.mode.label(),
+                    target_width_timing,
+                );
+                log::info!(
+                    "D-SPARK TARGET WIDTH TIMING mode={} status={}",
+                    runtime.mode.label(),
+                    target_width_timing,
+                );
                 let proposal_denominator = runtime.proposal_timing_rounds.max(1) as f64;
                 let verify_denominator = runtime.batch_verify_rounds.max(1) as f64;
                 let proposal_phase_ms = |seconds: f64| seconds / proposal_denominator * 1000.0;
