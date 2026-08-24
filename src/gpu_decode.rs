@@ -13,8 +13,12 @@
 //! into the CUDA module at init time.
 
 use pyo3::prelude::*;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cudarc::cublas::result as cublas_result;
@@ -38,6 +42,473 @@ const ROUTE_LOCALITY_ADAPTIVE_SPLITS: &[f64] = &[50.0, 25.0, 75.0, 0.0, 100.0];
 const BF16_MAMBA2_IN_PROJ_PREFILL_EQUIV_MIN_COLS: usize = 33;
 const DSPARK_DIAGNOSTIC_VERIFY_ROWS_ENV: &str = "KRASIS_DSPARK_DIAGNOSTIC_VERIFY_ROWS";
 const DSPARK_DIAGNOSTIC_SCALAR_TARGET_ENV: &str = "KRASIS_DSPARK_DIAGNOSTIC_SCALAR_TARGET";
+const DSPARK_F5_HEAD_PARITY_ENV: &str = "KRASIS_DSPARK_F5_HEAD_PARITY";
+const DSPARK_F5_HEAD_PARITY_DIR_ENV: &str = "KRASIS_DSPARK_F5_HEAD_PARITY_DIR";
+const DSPARK_F5_HEAD_PARITY_SCHEMA: &str = "krasis_dspark_m1c_f5_head_parity_v1";
+const DSPARK_F5_HEAD_PARITY_PREFIX: &str = "D-SPARK F5 HEAD PARITY ";
+const DSPARK_F5_ARTIFACT_NAMES: [&str; 3] = [
+    "round000-row000-production-raw-f32le.bin",
+    "round000-row000-shadow-n1-a-raw-f32le.bin",
+    "round000-row000-shadow-n1-b-raw-f32le.bin",
+];
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DsparkF5FloatCounts {
+    finite_count: usize,
+    nan_count: usize,
+    positive_infinity_count: usize,
+    negative_infinity_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct DsparkF5TopEntry {
+    token_id: usize,
+    value: f32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct DsparkF5DecisionVector {
+    argmax_token_id: usize,
+    top_ten: Vec<DsparkF5TopEntry>,
+    rank_eleven: DsparkF5TopEntry,
+    top_one_top_two_margin: f64,
+    rank_ten_rank_eleven_margin: f64,
+    selected_token_id: usize,
+    selected_token_value: f32,
+    selected_token_log_probability: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DsparkF5UlpSummary {
+    p50: u32,
+    p95: u32,
+    p99: u32,
+    max: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct DsparkF5FiniteDeltaSummary {
+    max_absolute_delta: f64,
+    max_absolute_delta_token_id: usize,
+    mean_absolute_delta: f64,
+    rms_delta: f64,
+    normalized_rms_delta: f64,
+    max_relative_delta: f64,
+    max_relative_delta_token_id: usize,
+    ulp_distance: DsparkF5UlpSummary,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct DsparkF5DecisionComparison {
+    production: DsparkF5DecisionVector,
+    shadow: DsparkF5DecisionVector,
+    same_argmax: bool,
+    top_ten_order_equal: bool,
+    top_ten_overlap_count: usize,
+    selected_token_log_probability_delta: f64,
+    twice_max_abs_delta_below_smaller_top_one_top_two_margin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct DsparkF5Comparison {
+    vector_length: usize,
+    production_counts: DsparkF5FloatCounts,
+    shadow_counts: DsparkF5FloatCounts,
+    bitwise_unequal_element_count: usize,
+    finite_pair_count: usize,
+    nonfinite_pair_count: usize,
+    nonfinite_mismatch_count: usize,
+    finite_delta: Option<DsparkF5FiniteDeltaSummary>,
+    decision: Option<DsparkF5DecisionComparison>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DsparkF5Artifact {
+    basename: String,
+    byte_count: usize,
+    sha256: String,
+}
+
+fn dspark_f5_float_counts(values: &[f32]) -> DsparkF5FloatCounts {
+    let mut counts = DsparkF5FloatCounts {
+        finite_count: 0,
+        nan_count: 0,
+        positive_infinity_count: 0,
+        negative_infinity_count: 0,
+    };
+    for &value in values {
+        if value.is_finite() {
+            counts.finite_count += 1;
+        } else if value.is_nan() {
+            counts.nan_count += 1;
+        } else if value.is_sign_positive() {
+            counts.positive_infinity_count += 1;
+        } else {
+            counts.negative_infinity_count += 1;
+        }
+    }
+    counts
+}
+
+fn dspark_f5_f32_le_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    bytes
+}
+
+fn dspark_f5_fnv1a_f32le(values: &[f32]) -> String {
+    format!(
+        "{:016x}",
+        validation_fnv1a_u64(&dspark_f5_f32_le_bytes(values))
+    )
+}
+
+fn dspark_f5_ordered_f32_bits(value: f32) -> u32 {
+    let bits = value.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+}
+
+fn dspark_f5_ulp_distance(left: f32, right: f32) -> Option<u32> {
+    if !left.is_finite() || !right.is_finite() {
+        return None;
+    }
+    Some(dspark_f5_ordered_f32_bits(left).abs_diff(dspark_f5_ordered_f32_bits(right)))
+}
+
+fn dspark_f5_nearest_rank(sorted: &[u32], numerator: usize, denominator: usize) -> u32 {
+    let rank = sorted
+        .len()
+        .saturating_mul(numerator)
+        .saturating_add(denominator - 1)
+        / denominator;
+    sorted[rank.saturating_sub(1)]
+}
+
+fn dspark_f5_rank_top_eleven(values: &[f32]) -> Option<Vec<DsparkF5TopEntry>> {
+    if values.len() < 11 || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut ranked = values
+        .iter()
+        .copied()
+        .enumerate()
+        .collect::<Vec<(usize, f32)>>();
+    ranked.sort_unstable_by(|left, right| {
+        if left.1 == right.1 {
+            left.0.cmp(&right.0)
+        } else {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .expect("finite F5 logits are comparable")
+        }
+    });
+    Some(
+        ranked
+            .into_iter()
+            .take(11)
+            .map(|(token_id, value)| DsparkF5TopEntry { token_id, value })
+            .collect(),
+    )
+}
+
+fn dspark_f5_selected_log_probability(values: &[f32], selected: usize) -> Option<f64> {
+    if selected >= values.len() || values.is_empty() || values.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let max_value = values.iter().fold(f64::NEG_INFINITY, |maximum, &value| {
+        maximum.max(value as f64)
+    });
+    let mut exp_sum = 0.0f64;
+    for &value in values {
+        exp_sum += ((value as f64) - max_value).exp();
+    }
+    Some(values[selected] as f64 - max_value - exp_sum.ln())
+}
+
+fn dspark_f5_decision_vector(
+    values: &[f32],
+    selected_token_id: usize,
+) -> Option<DsparkF5DecisionVector> {
+    let ranked = dspark_f5_rank_top_eleven(values)?;
+    let selected_token_log_probability =
+        dspark_f5_selected_log_probability(values, selected_token_id)?;
+    Some(DsparkF5DecisionVector {
+        argmax_token_id: ranked[0].token_id,
+        top_ten: ranked[..10].to_vec(),
+        rank_eleven: ranked[10].clone(),
+        top_one_top_two_margin: ranked[0].value as f64 - ranked[1].value as f64,
+        rank_ten_rank_eleven_margin: ranked[9].value as f64 - ranked[10].value as f64,
+        selected_token_id,
+        selected_token_value: values[selected_token_id],
+        selected_token_log_probability,
+    })
+}
+
+fn dspark_f5_compare_logits(
+    production: &[f32],
+    shadow: &[f32],
+) -> Result<DsparkF5Comparison, String> {
+    if production.is_empty() || production.len() != shadow.len() {
+        return Err(format!(
+            "D-Spark F5 comparison geometry mismatch: production={} shadow={}",
+            production.len(),
+            shadow.len(),
+        ));
+    }
+    let production_counts = dspark_f5_float_counts(production);
+    let shadow_counts = dspark_f5_float_counts(shadow);
+    let mut bitwise_unequal_element_count = 0usize;
+    let mut finite_pair_count = 0usize;
+    let mut nonfinite_pair_count = 0usize;
+    let mut nonfinite_mismatch_count = 0usize;
+    let mut max_absolute_delta = 0.0f64;
+    let mut max_absolute_delta_token_id = 0usize;
+    let mut sum_absolute_delta = 0.0f64;
+    let mut sum_squared_delta = 0.0f64;
+    let mut shadow_sum_squares = 0.0f64;
+    let mut max_relative_delta = 0.0f64;
+    let mut max_relative_delta_token_id = 0usize;
+    let mut ulp_distances = Vec::with_capacity(production.len());
+
+    for (token_id, (&production_value, &shadow_value)) in production.iter().zip(shadow).enumerate()
+    {
+        let bits_differ = production_value.to_bits() != shadow_value.to_bits();
+        if bits_differ {
+            bitwise_unequal_element_count += 1;
+        }
+        if production_value.is_finite() && shadow_value.is_finite() {
+            finite_pair_count += 1;
+            let delta = production_value as f64 - shadow_value as f64;
+            let absolute_delta = delta.abs();
+            if absolute_delta > max_absolute_delta {
+                max_absolute_delta = absolute_delta;
+                max_absolute_delta_token_id = token_id;
+            }
+            sum_absolute_delta += absolute_delta;
+            sum_squared_delta += delta * delta;
+            shadow_sum_squares += (shadow_value as f64) * (shadow_value as f64);
+            let relative_delta = absolute_delta
+                / (production_value as f64)
+                    .abs()
+                    .max((shadow_value as f64).abs())
+                    .max(1e-12);
+            if relative_delta > max_relative_delta {
+                max_relative_delta = relative_delta;
+                max_relative_delta_token_id = token_id;
+            }
+            ulp_distances.push(
+                dspark_f5_ulp_distance(production_value, shadow_value)
+                    .expect("finite F5 values have a ULP distance"),
+            );
+        } else {
+            nonfinite_pair_count += 1;
+            if bits_differ {
+                nonfinite_mismatch_count += 1;
+            }
+        }
+    }
+
+    let all_finite = finite_pair_count == production.len();
+    let finite_delta = if all_finite {
+        ulp_distances.sort_unstable();
+        let denominator = production.len() as f64;
+        let rms_delta = (sum_squared_delta / denominator).sqrt();
+        let shadow_rms = (shadow_sum_squares / denominator).sqrt();
+        Some(DsparkF5FiniteDeltaSummary {
+            max_absolute_delta,
+            max_absolute_delta_token_id,
+            mean_absolute_delta: sum_absolute_delta / denominator,
+            rms_delta,
+            normalized_rms_delta: rms_delta / shadow_rms.max(f64::MIN_POSITIVE),
+            max_relative_delta,
+            max_relative_delta_token_id,
+            ulp_distance: DsparkF5UlpSummary {
+                p50: dspark_f5_nearest_rank(&ulp_distances, 50, 100),
+                p95: dspark_f5_nearest_rank(&ulp_distances, 95, 100),
+                p99: dspark_f5_nearest_rank(&ulp_distances, 99, 100),
+                max: *ulp_distances.last().expect("non-empty F5 ULP distances"),
+            },
+        })
+    } else {
+        None
+    };
+
+    let decision = if all_finite {
+        let production_top = dspark_f5_rank_top_eleven(production)
+            .ok_or_else(|| "D-Spark F5 production ranking failed".to_string())?;
+        let selected_token_id = production_top[0].token_id;
+        let production_decision = dspark_f5_decision_vector(production, selected_token_id)
+            .ok_or_else(|| "D-Spark F5 production decision summary failed".to_string())?;
+        let shadow_decision = dspark_f5_decision_vector(shadow, selected_token_id)
+            .ok_or_else(|| "D-Spark F5 shadow decision summary failed".to_string())?;
+        let production_ids = production_decision
+            .top_ten
+            .iter()
+            .map(|entry| entry.token_id)
+            .collect::<Vec<_>>();
+        let shadow_ids = shadow_decision
+            .top_ten
+            .iter()
+            .map(|entry| entry.token_id)
+            .collect::<Vec<_>>();
+        let production_set = production_ids.iter().copied().collect::<HashSet<_>>();
+        let top_ten_overlap_count = shadow_ids
+            .iter()
+            .filter(|token_id| production_set.contains(token_id))
+            .count();
+        let smallest_margin = production_decision
+            .top_one_top_two_margin
+            .min(shadow_decision.top_one_top_two_margin);
+        let max_abs = finite_delta
+            .as_ref()
+            .expect("finite F5 comparison has delta statistics")
+            .max_absolute_delta;
+        Some(DsparkF5DecisionComparison {
+            same_argmax: production_decision.argmax_token_id == shadow_decision.argmax_token_id,
+            top_ten_order_equal: production_ids == shadow_ids,
+            top_ten_overlap_count,
+            selected_token_log_probability_delta: production_decision
+                .selected_token_log_probability
+                - shadow_decision.selected_token_log_probability,
+            twice_max_abs_delta_below_smaller_top_one_top_two_margin: 2.0 * max_abs
+                < smallest_margin,
+            production: production_decision,
+            shadow: shadow_decision,
+        })
+    } else {
+        None
+    };
+
+    Ok(DsparkF5Comparison {
+        vector_length: production.len(),
+        production_counts,
+        shadow_counts,
+        bitwise_unequal_element_count,
+        finite_pair_count,
+        nonfinite_pair_count,
+        nonfinite_mismatch_count,
+        finite_delta,
+        decision,
+    })
+}
+
+fn parse_dspark_f5_head_parity_enabled(raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => Err(format!(
+            "invalid {DSPARK_F5_HEAD_PARITY_ENV}={value:?}; diagnostic enablement requires exactly 1"
+        )),
+    }
+}
+
+fn select_dspark_f5_head_parity_enabled(
+    calibrated: bool,
+    raw: Option<&str>,
+) -> Result<bool, String> {
+    if !calibrated {
+        return Ok(false);
+    }
+    parse_dspark_f5_head_parity_enabled(raw)
+}
+
+fn read_dspark_f5_head_parity_enabled(calibrated: bool) -> Result<bool, String> {
+    if !calibrated {
+        return Ok(false);
+    }
+    let raw = read_dspark_diagnostic_env(DSPARK_F5_HEAD_PARITY_ENV)?;
+    select_dspark_f5_head_parity_enabled(calibrated, raw.as_deref())
+}
+
+fn read_dspark_f5_artifact_dir() -> Result<PathBuf, String> {
+    let raw = std::env::var_os(DSPARK_F5_HEAD_PARITY_DIR_ENV)
+        .ok_or_else(|| format!("{DSPARK_F5_HEAD_PARITY_DIR_ENV} is required"))?;
+    if raw.is_empty() {
+        return Err(format!("{DSPARK_F5_HEAD_PARITY_DIR_ENV} is empty"));
+    }
+    let path = PathBuf::from(raw);
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("D-Spark F5 artifact directory metadata: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("D-Spark F5 artifact destination is not a directory".to_string());
+    }
+    Ok(path)
+}
+
+fn dspark_f5_preflight_artifacts(directory: &Path) -> Result<(), String> {
+    for basename in DSPARK_F5_ARTIFACT_NAMES {
+        match std::fs::symlink_metadata(directory.join(basename)) {
+            Ok(_) => {
+                return Err(format!(
+                    "D-Spark F5 artifact already exists and will not be overwritten: {basename}"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "D-Spark F5 artifact preflight failed for {basename}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dspark_f5_write_artifact(
+    directory: &Path,
+    basename: &str,
+    values: &[f32],
+) -> Result<DsparkF5Artifact, String> {
+    if !DSPARK_F5_ARTIFACT_NAMES.contains(&basename) {
+        return Err("D-Spark F5 rejected an unregistered artifact basename".to_string());
+    }
+    if values.len() != 129_280 {
+        return Err(format!(
+            "D-Spark F5 artifact {basename} has {} values; expected 129280",
+            values.len(),
+        ));
+    }
+    let bytes = dspark_f5_f32_le_bytes(values);
+    let path = directory.join(basename);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("D-Spark F5 artifact create {basename}: {error}"))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("D-Spark F5 artifact write {basename}: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("D-Spark F5 artifact flush {basename}: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("D-Spark F5 artifact sync {basename}: {error}"))?;
+    drop(file);
+
+    let mut reopened = File::open(&path)
+        .map_err(|error| format!("D-Spark F5 artifact reopen {basename}: {error}"))?;
+    let mut verified = Vec::new();
+    reopened
+        .read_to_end(&mut verified)
+        .map_err(|error| format!("D-Spark F5 artifact reread {basename}: {error}"))?;
+    if verified.len() != bytes.len() || verified != bytes {
+        return Err(format!(
+            "D-Spark F5 artifact verification failed for {basename}: expected {} bytes, read {}",
+            bytes.len(),
+            verified.len(),
+        ));
+    }
+    Ok(DsparkF5Artifact {
+        basename: basename.to_string(),
+        byte_count: verified.len(),
+        sha256: format!("{:x}", Sha256::digest(&verified)),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HcsSoftHostMode {
@@ -8547,22 +9018,24 @@ pub(crate) mod dsa_registration_tests {
 
     use super::{
         claimed_peer_route_slots, create_decode_timing_event, dependency_preserving_route_schedule,
-        dspark_expected_emitted_tokens, dspark_residency_scan_required,
-        dspark_target_cache_restore_slots, dspark_target_cache_rows, dspark_trace_f32_host_rows,
-        dspark_verification_batch_plan, dynamic_peer_shard, graph_w13_path,
-        layer_split_sequence_state_contract, marlin_dispatch_for_bits,
-        measured_peer_route_admission, occupancy_active_blocks_per_multiprocessor,
-        parse_dspark_diagnostic_scalar_target, parse_dspark_diagnostic_verify_rows,
+        dspark_expected_emitted_tokens, dspark_f5_compare_logits, dspark_f5_float_counts,
+        dspark_f5_rank_top_eleven, dspark_f5_ulp_distance, dspark_f5_write_artifact,
+        dspark_residency_scan_required, dspark_target_cache_restore_slots,
+        dspark_target_cache_rows, dspark_trace_f32_host_rows, dspark_verification_batch_plan,
+        dynamic_peer_shard, graph_w13_path, layer_split_sequence_state_contract,
+        marlin_dispatch_for_bits, measured_peer_route_admission,
+        occupancy_active_blocks_per_multiprocessor, parse_dspark_diagnostic_scalar_target,
+        parse_dspark_diagnostic_verify_rows, parse_dspark_f5_head_parity_enabled,
         peer_selector_check_message, plan_dsa_topk, route_prep_rmsnorm_threads,
-        select_dspark_diagnostic_verify_rows, split_expert_launch_enabled,
-        validate_dsa_indexer_registration, validate_dsa_owner_weight_contract,
-        validate_dsa_runtime_registration, validate_dspark_residency_contract,
-        validate_stream_probe_outcome, CudaEvent, CudaStream, DsaGraphScoreBackend,
-        DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds, DsparkResidencyMode,
-        DsparkTargetCacheRowMapping, DsparkVerificationPolicy, ExpertDataPtr, GpuAttnConfig,
-        GpuDecodeStore, GpuWeight, GraphW13Path, HqqStageAsyncCopyMode, PeerDemandEntry,
-        PeerDynamicTier, PeerRoutedExpert, PendingPeerDispatch, RouteLocalityGlobalLruState,
-        DSA_TOPK_RADIX_THREADS, MODULE_NAME,
+        select_dspark_diagnostic_verify_rows, select_dspark_f5_head_parity_enabled,
+        split_expert_launch_enabled, validate_dsa_indexer_registration,
+        validate_dsa_owner_weight_contract, validate_dsa_runtime_registration,
+        validate_dspark_residency_contract, validate_stream_probe_outcome, CudaEvent, CudaStream,
+        DsaGraphScoreBackend, DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds,
+        DsparkResidencyMode, DsparkTargetCacheRowMapping, DsparkVerificationPolicy, ExpertDataPtr,
+        GpuAttnConfig, GpuDecodeStore, GpuWeight, GraphW13Path, HqqStageAsyncCopyMode,
+        PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert, PendingPeerDispatch,
+        RouteLocalityGlobalLruState, DSA_TOPK_RADIX_THREADS, DSPARK_F5_ARTIFACT_NAMES, MODULE_NAME,
     };
 
     static DSA_CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -8780,6 +9253,167 @@ pub(crate) mod dsa_registration_tests {
         );
         assert!(dspark_trace_f32_host_rows(&values, 0, 4, 4, "test").is_err());
         assert!(dspark_trace_f32_host_rows(&values[..4], 2, 4, 4, "test").is_err());
+    }
+
+    #[test]
+    fn dspark_f5_exact_and_signed_zero_fixtures_preserve_bit_semantics() {
+        let exact = (0..12).map(|index| index as f32 - 6.0).collect::<Vec<_>>();
+        let exact_comparison = dspark_f5_compare_logits(&exact, &exact).unwrap();
+        assert_eq!(exact_comparison.bitwise_unequal_element_count, 0);
+        assert_eq!(
+            exact_comparison
+                .finite_delta
+                .as_ref()
+                .unwrap()
+                .max_absolute_delta,
+            0.0
+        );
+        assert_eq!(
+            exact_comparison
+                .finite_delta
+                .as_ref()
+                .unwrap()
+                .ulp_distance
+                .max,
+            0
+        );
+
+        let mut negative_zero = (0..12).map(|index| -(index as f32)).collect::<Vec<_>>();
+        let mut positive_zero = negative_zero.clone();
+        negative_zero[0] = -0.0;
+        positive_zero[0] = 0.0;
+        let zero_comparison = dspark_f5_compare_logits(&negative_zero, &positive_zero).unwrap();
+        assert_eq!(zero_comparison.bitwise_unequal_element_count, 1);
+        assert_eq!(
+            zero_comparison
+                .finite_delta
+                .as_ref()
+                .unwrap()
+                .max_absolute_delta,
+            0.0
+        );
+        assert_eq!(
+            zero_comparison
+                .finite_delta
+                .as_ref()
+                .unwrap()
+                .ulp_distance
+                .max,
+            1
+        );
+    }
+
+    #[test]
+    fn dspark_f5_enable_parser_requires_the_exact_opt_in_value() {
+        assert!(!parse_dspark_f5_head_parity_enabled(None).unwrap());
+        assert!(parse_dspark_f5_head_parity_enabled(Some("1")).unwrap());
+        for invalid in ["", "0", "true", "yes", " 1", "1 "] {
+            assert!(parse_dspark_f5_head_parity_enabled(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn dspark_f5_is_ignored_during_width_calibration_and_strict_afterward() {
+        for raw in [None, Some(""), Some("0"), Some("1"), Some("true")] {
+            assert!(!select_dspark_f5_head_parity_enabled(false, raw).unwrap());
+        }
+        assert!(select_dspark_f5_head_parity_enabled(true, Some("1")).unwrap());
+        assert!(!select_dspark_f5_head_parity_enabled(true, None).unwrap());
+        for invalid in ["", "0", "true", "yes", " 1", "1 "] {
+            assert!(select_dspark_f5_head_parity_enabled(true, Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn dspark_f5_near_zero_and_one_ulp_fixtures_are_exact() {
+        let production = (0..12)
+            .map(|index| 20.0f32 - index as f32)
+            .collect::<Vec<_>>();
+        let mut near_zero_production = production.clone();
+        let mut near_zero_shadow = production.clone();
+        near_zero_production[11] = 0.0;
+        near_zero_shadow[11] = 1e-13;
+        let near_zero = dspark_f5_compare_logits(&near_zero_production, &near_zero_shadow).unwrap();
+        let relative = near_zero.finite_delta.as_ref().unwrap().max_relative_delta;
+        assert!((relative - 0.1).abs() < 1e-6);
+
+        let mut one_ulp_shadow = production.clone();
+        one_ulp_shadow[5] = f32::from_bits(production[5].to_bits() + 1);
+        let one_ulp = dspark_f5_compare_logits(&production, &one_ulp_shadow).unwrap();
+        assert_eq!(one_ulp.bitwise_unequal_element_count, 1);
+        assert_eq!(one_ulp.finite_delta.as_ref().unwrap().ulp_distance.max, 1);
+        assert_eq!(
+            dspark_f5_ulp_distance(production[5], one_ulp_shadow[5]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn dspark_f5_nonfinite_fixture_reports_class_and_bit_mismatch() {
+        let counts = dspark_f5_float_counts(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0]);
+        assert_eq!(counts.finite_count, 1);
+        assert_eq!(counts.nan_count, 1);
+        assert_eq!(counts.positive_infinity_count, 1);
+        assert_eq!(counts.negative_infinity_count, 1);
+
+        let mut production = (0..12).map(|index| index as f32).collect::<Vec<_>>();
+        let mut shadow = production.clone();
+        production[3] = f32::INFINITY;
+        shadow[3] = f32::NEG_INFINITY;
+        let comparison = dspark_f5_compare_logits(&production, &shadow).unwrap();
+        assert_eq!(comparison.nonfinite_pair_count, 1);
+        assert_eq!(comparison.nonfinite_mismatch_count, 1);
+        assert_eq!(comparison.bitwise_unequal_element_count, 1);
+        assert!(comparison.finite_delta.is_none());
+        assert!(comparison.decision.is_none());
+        assert_eq!(dspark_f5_ulp_distance(f32::INFINITY, 1.0), None);
+    }
+
+    #[test]
+    fn dspark_f5_topk_ties_and_decision_margin_follow_frozen_rules() {
+        let tied = vec![
+            5.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0,
+        ];
+        let ranking = dspark_f5_rank_top_eleven(&tied).unwrap();
+        assert_eq!(ranking[0].token_id, 0);
+        assert_eq!(ranking[1].token_id, 1);
+        assert_eq!(ranking[10].token_id, 10);
+
+        let production = vec![10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0];
+        let mut shadow = production.clone();
+        shadow[0] = 9.9;
+        shadow[1] = 9.05;
+        let comparison = dspark_f5_compare_logits(&production, &shadow).unwrap();
+        let decision = comparison.decision.as_ref().unwrap();
+        assert!(decision.same_argmax);
+        assert!(decision.top_ten_order_equal);
+        assert_eq!(decision.top_ten_overlap_count, 10);
+        assert!(decision.twice_max_abs_delta_below_smaller_top_one_top_two_margin);
+    }
+
+    #[test]
+    fn dspark_f5_artifact_is_exact_little_endian_and_no_clobber() {
+        let unique = format!(
+            "krasis-f5-artifact-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir(&directory).unwrap();
+        let values = vec![1.0f32; 129_280];
+        let artifact =
+            dspark_f5_write_artifact(&directory, DSPARK_F5_ARTIFACT_NAMES[0], &values).unwrap();
+        assert_eq!(artifact.byte_count, 517_120);
+        let bytes = std::fs::read(directory.join(DSPARK_F5_ARTIFACT_NAMES[0])).unwrap();
+        assert_eq!(&bytes[..4], &1.0f32.to_bits().to_le_bytes());
+        assert!(
+            dspark_f5_write_artifact(&directory, DSPARK_F5_ARTIFACT_NAMES[0], &values).is_err()
+        );
+        std::fs::remove_file(directory.join(DSPARK_F5_ARTIFACT_NAMES[0])).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -70208,6 +70842,20 @@ impl GpuDecodeStore {
         }
         let layer_trace_enabled =
             runtime.verification_policy.calibrated && env_truthy("KRASIS_DSPARK_BATCH_LAYER_TRACE");
+        let f5_enabled =
+            read_dspark_f5_head_parity_enabled(runtime.verification_policy.calibrated)?;
+        let f5_artifact_dir = if f5_enabled && runtime.batch_verify_rounds == 0 {
+            if batch_size != 2 || tokens != [204, 201] || positions != [1000, 1001] {
+                return Err(format!(
+                    "D-Spark F5 round-zero contract mismatch: batch_size={batch_size} tokens={tokens:?} positions={positions:?}"
+                ));
+            }
+            let directory = read_dspark_f5_artifact_dir()?;
+            dspark_f5_preflight_artifacts(&directory)?;
+            Some(directory)
+        } else {
+            None
+        };
         if positions
             .windows(2)
             .any(|window| window[0].checked_add(1) != Some(window[1]))
@@ -70600,9 +71248,78 @@ impl GpuDecodeStore {
         let lm_head = graph
             .weights
             .get(graph.lm_head_wid)
+            .cloned()
             .ok_or("D-Spark target LM head is absent")?;
+        let f5_geometry = if f5_artifact_dir.is_some() {
+            if lm_head.dtype != 0
+                || lm_head.rows != 129_280
+                || lm_head.cols != 4_096
+                || graph.vocab_size != 129_280
+                || hidden != 4_096
+            {
+                return Err(format!(
+                    "D-Spark F5 LM-head contract mismatch: dtype={} rows={} cols={} vocab={} hidden={}",
+                    lm_head.dtype, lm_head.rows, lm_head.cols, graph.vocab_size, hidden,
+                ));
+            }
+            if graph.final_logit_softcap.to_bits() != 0.0f32.to_bits() {
+                return Err(format!(
+                    "D-Spark F5 requires final-logit softcap +0.0, got {}",
+                    graph.final_logit_softcap,
+                ));
+            }
+            if batch_size >= graph.batch_max {
+                return Err(format!(
+                    "D-Spark F5 needs one inactive logit slot: batch_size={batch_size} capacity={}",
+                    graph.batch_max,
+                ));
+            }
+            let active_end_elements = batch_size
+                .checked_mul(graph.vocab_size)
+                .ok_or_else(|| "D-Spark F5 active-logit range overflow".to_string())?;
+            let spare_slot = batch_size;
+            let spare_start_elements = spare_slot
+                .checked_mul(graph.vocab_size)
+                .ok_or_else(|| "D-Spark F5 spare-logit offset overflow".to_string())?;
+            let spare_end_elements = spare_slot
+                .checked_add(1)
+                .and_then(|rows| rows.checked_mul(graph.vocab_size))
+                .ok_or_else(|| "D-Spark F5 spare-logit range overflow".to_string())?;
+            if active_end_elements > spare_start_elements {
+                return Err("D-Spark F5 active and spare logit ranges overlap".to_string());
+            }
+            let logit_capacity = graph
+                .d_batch_logits
+                .as_ref()
+                .ok_or("D-Spark F5 batch-logit allocation is absent")?
+                .len();
+            if logit_capacity < spare_end_elements {
+                return Err(format!(
+                    "D-Spark F5 batch-logit capacity {logit_capacity} is below required {spare_end_elements}"
+                ));
+            }
+            let spare_byte_offset = spare_start_elements
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| "D-Spark F5 spare-logit byte offset overflow".to_string())?;
+            let spare_ptr = d_batch_logits_ptr
+                .checked_add(
+                    u64::try_from(spare_byte_offset)
+                        .map_err(|_| "D-Spark F5 spare-logit offset exceeds u64".to_string())?,
+                )
+                .ok_or_else(|| "D-Spark F5 spare-logit pointer overflow".to_string())?;
+            Some((
+                spare_ptr,
+                spare_slot,
+                spare_start_elements,
+                spare_end_elements,
+                spare_byte_offset,
+                logit_capacity,
+            ))
+        } else {
+            None
+        };
         self.gemm_bf16_to_f32_batch(
-            lm_head,
+            &lm_head,
             d_batch_hidden_ptr,
             d_batch_logits_ptr,
             batch_size,
@@ -70626,6 +71343,208 @@ impl GpuDecodeStore {
         };
         if result != cuda_sys::CUresult::CUDA_SUCCESS {
             return Err(format!("D-Spark target batch logits D2H: {result:?}"));
+        }
+        if let (
+            Some(f5_directory),
+            Some((
+                spare_ptr,
+                spare_slot,
+                spare_start_elements,
+                spare_end_elements,
+                spare_byte_offset,
+                logit_capacity,
+            )),
+        ) = (f5_artifact_dir.as_ref(), f5_geometry)
+        {
+            let production_raw = graph.h_batch_logits[..graph.vocab_size].to_vec();
+            let mut cublas_stream: cublas_sys::cudaStream_t = std::ptr::null_mut();
+            let get_stream = unsafe { cublas_sys::lib() }
+                .cublasGetStream_v2
+                .as_ref()
+                .map_err(|error| format!("D-Spark F5 cublasGetStream_v2 unavailable: {error}"))?;
+            let stream_status = unsafe { get_stream(*self.blas.handle(), &mut cublas_stream) };
+            if stream_status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(format!(
+                    "D-Spark F5 cublasGetStream_v2 failed: {stream_status:?}"
+                ));
+            }
+            let cublas_device_stream_equal =
+                (cublas_stream as *mut std::ffi::c_void) == (stream as *mut std::ffi::c_void);
+            if !cublas_device_stream_equal {
+                return Err("D-Spark F5 cuBLAS/device stream mismatch".to_string());
+            }
+
+            let final_hidden_hashes = dspark_trace_bf16_rows(
+                d_batch_hidden_ptr,
+                1,
+                hidden,
+                hidden,
+                "F5 row-zero final hidden",
+            )?;
+            let final_hidden_fnv1a64 = final_hidden_hashes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "D-Spark F5 final-hidden hash is absent".to_string())?;
+            let logit_bytes = graph
+                .vocab_size
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| "D-Spark F5 shadow-logit byte size overflow".to_string())?;
+            let run_shadow = |label: &str| -> Result<Vec<f32>, String> {
+                self.gemv_bf16_to_f32(&lm_head, d_batch_hidden_ptr, spare_ptr)?;
+                self.device
+                    .synchronize()
+                    .map_err(|error| format!("D-Spark F5 {label} sync: {error:?}"))?;
+                let mut host = vec![0.0f32; graph.vocab_size];
+                let copy_status = unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        host.as_mut_ptr() as *mut std::ffi::c_void,
+                        spare_ptr,
+                        logit_bytes,
+                    )
+                };
+                if copy_status != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("D-Spark F5 {label} D2H: {copy_status:?}"));
+                }
+                Ok(host)
+            };
+            let shadow_n1_a_raw = run_shadow("shadow N=1 A")?;
+            let shadow_n1_b_raw = run_shadow("shadow N=1 B")?;
+
+            let artifacts = vec![
+                dspark_f5_write_artifact(
+                    f5_directory,
+                    DSPARK_F5_ARTIFACT_NAMES[0],
+                    &production_raw,
+                )?,
+                dspark_f5_write_artifact(
+                    f5_directory,
+                    DSPARK_F5_ARTIFACT_NAMES[1],
+                    &shadow_n1_a_raw,
+                )?,
+                dspark_f5_write_artifact(
+                    f5_directory,
+                    DSPARK_F5_ARTIFACT_NAMES[2],
+                    &shadow_n1_b_raw,
+                )?,
+            ];
+
+            let mut production_post_softcap = production_raw.clone();
+            let mut shadow_n1_a_post_softcap = shadow_n1_a_raw.clone();
+            let mut shadow_n1_b_post_softcap = shadow_n1_b_raw.clone();
+            apply_logit_softcap_in_place(&mut production_post_softcap, graph.final_logit_softcap);
+            apply_logit_softcap_in_place(&mut shadow_n1_a_post_softcap, graph.final_logit_softcap);
+            apply_logit_softcap_in_place(&mut shadow_n1_b_post_softcap, graph.final_logit_softcap);
+
+            let raw_comparison_a = dspark_f5_compare_logits(&production_raw, &shadow_n1_a_raw)?;
+            let raw_comparison_b = dspark_f5_compare_logits(&production_raw, &shadow_n1_b_raw)?;
+            let post_softcap_comparison_a =
+                dspark_f5_compare_logits(&production_post_softcap, &shadow_n1_a_post_softcap)?;
+            let post_softcap_comparison_b =
+                dspark_f5_compare_logits(&production_post_softcap, &shadow_n1_b_post_softcap)?;
+            let active_row_zero_byte_offset = 0usize;
+            let active_end_byte_offset = batch_size
+                .checked_mul(graph.vocab_size)
+                .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| "D-Spark F5 active-logit byte range overflow".to_string())?;
+            let spare_end_byte_offset = spare_end_elements
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| "D-Spark F5 spare-logit byte range overflow".to_string())?;
+            let record = serde_json::json!({
+                "schema": DSPARK_F5_HEAD_PARITY_SCHEMA,
+                "round_zero_indexed": runtime.batch_verify_rounds,
+                "tokens": tokens,
+                "positions": positions,
+                "row_zero_input_token_id": tokens[0],
+                "row_zero_absolute_position": positions[0],
+                "production_batch_width": batch_size,
+                "active_row": 0,
+                "spare_slot": spare_slot,
+                "head": {
+                    "dtype": lm_head.dtype,
+                    "rows": lm_head.rows,
+                    "columns": lm_head.cols,
+                    "vocabulary_size": graph.vocab_size,
+                    "hidden_size": hidden,
+                    "ldb": hidden,
+                    "ldc": graph.vocab_size,
+                },
+                "geometry": {
+                    "batch_capacity_rows": graph.batch_max,
+                    "logit_buffer_capacity_elements": logit_capacity,
+                    "active_row_zero_offset_elements": 0,
+                    "active_row_zero_offset_bytes": active_row_zero_byte_offset,
+                    "active_end_offset_elements": spare_start_elements,
+                    "active_end_offset_bytes": active_end_byte_offset,
+                    "spare_start_offset_elements": spare_start_elements,
+                    "spare_start_offset_bytes": spare_byte_offset,
+                    "spare_end_offset_elements": spare_end_elements,
+                    "spare_end_offset_bytes": spare_end_byte_offset,
+                    "active_spare_nonoverlap": active_end_byte_offset <= spare_byte_offset,
+                },
+                "execution": {
+                    "production_sync_complete_before_shadow": true,
+                    "production_d2h_complete_before_shadow": true,
+                    "cublas_device_stream_equal": cublas_device_stream_equal,
+                    "shadow_a_sync_and_d2h_complete_before_shadow_b": true,
+                    "shadow_gpu_slot_inactive": spare_slot == batch_size,
+                    "active_host_logits_unchanged_by_shadows": true,
+                },
+                "final_logit_softcap": graph.final_logit_softcap,
+                "row_zero_final_hidden_fnv1a64": final_hidden_fnv1a64,
+                "hash_algorithms": {
+                    "trace_and_vector": "FNV-1a64 offset=14695981039346656037 prime=1099511628211 modulo=2^64 over little-endian bytes",
+                    "artifacts": "SHA-256 lowercase hexadecimal",
+                },
+                "vectors": {
+                    "production": {
+                        "raw_fnv1a64": dspark_f5_fnv1a_f32le(&production_raw),
+                        "post_softcap_fnv1a64": dspark_f5_fnv1a_f32le(&production_post_softcap),
+                        "raw_counts": dspark_f5_float_counts(&production_raw),
+                        "post_softcap_counts": dspark_f5_float_counts(&production_post_softcap),
+                    },
+                    "shadow_n1_a": {
+                        "raw_fnv1a64": dspark_f5_fnv1a_f32le(&shadow_n1_a_raw),
+                        "post_softcap_fnv1a64": dspark_f5_fnv1a_f32le(&shadow_n1_a_post_softcap),
+                        "raw_counts": dspark_f5_float_counts(&shadow_n1_a_raw),
+                        "post_softcap_counts": dspark_f5_float_counts(&shadow_n1_a_post_softcap),
+                    },
+                    "shadow_n1_b": {
+                        "raw_fnv1a64": dspark_f5_fnv1a_f32le(&shadow_n1_b_raw),
+                        "post_softcap_fnv1a64": dspark_f5_fnv1a_f32le(&shadow_n1_b_post_softcap),
+                        "raw_counts": dspark_f5_float_counts(&shadow_n1_b_raw),
+                        "post_softcap_counts": dspark_f5_float_counts(&shadow_n1_b_post_softcap),
+                    },
+                },
+                "controls": {
+                    "shadow_n1_a_b_bitwise_equal": shadow_n1_a_raw
+                        .iter()
+                        .zip(&shadow_n1_b_raw)
+                        .all(|(left, right)| left.to_bits() == right.to_bits()),
+                    "raw_comparison_objects_identical": raw_comparison_a == raw_comparison_b,
+                    "post_softcap_comparison_objects_identical": post_softcap_comparison_a
+                        == post_softcap_comparison_b,
+                    "raw_post_softcap_hashes_equal": production_raw
+                        .iter()
+                        .zip(&production_post_softcap)
+                        .chain(shadow_n1_a_raw.iter().zip(&shadow_n1_a_post_softcap))
+                        .chain(shadow_n1_b_raw.iter().zip(&shadow_n1_b_post_softcap))
+                        .all(|(left, right)| left.to_bits() == right.to_bits()),
+                },
+                "comparisons": {
+                    "raw": {
+                        "production_vs_shadow_n1_a": raw_comparison_a,
+                        "production_vs_shadow_n1_b": raw_comparison_b,
+                    },
+                    "post_softcap": {
+                        "production_vs_shadow_n1_a": post_softcap_comparison_a,
+                        "production_vs_shadow_n1_b": post_softcap_comparison_b,
+                    },
+                },
+                "artifacts": artifacts,
+            });
+            let record = serde_json::to_string(&record)
+                .map_err(|error| format!("D-Spark F5 record serialization: {error}"))?;
+            eprintln!("{DSPARK_F5_HEAD_PARITY_PREFIX}{record}");
         }
         apply_logit_softcap_in_place(
             &mut graph.h_batch_logits[..total_logits],
