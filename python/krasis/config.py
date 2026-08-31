@@ -337,6 +337,12 @@ def _detect_layers_prefix(model_path: str) -> str:
     if os.path.exists(config_path):
         with open(config_path) as f:
             raw = json.load(f)
+        text_config = raw.get("text_config")
+        if (
+            isinstance(text_config, dict)
+            and text_config.get("model_type") == "glm5_next_text"
+        ):
+            return "model.language_model"
         if "text_config" in raw:
             return "language_model.model"
     return "model"
@@ -557,6 +563,10 @@ class ModelConfig:
     indexer_types: Optional[List[str]] = None
     indexer_rope_interleave: bool = False
     index_share_for_mtp_iteration: bool = False
+    index_kpool: int = 0
+    index_kpool_compress: bool = False
+    index_kpool_always_select_tail: bool = False
+    mla_use_nope: bool = False
 
     # DeepSeek-V4 compressed sparse attention. These fields are deliberately
     # separate from MLA/GLM-DSA because the cache and indexer semantics differ.
@@ -569,6 +579,8 @@ class ModelConfig:
     hc_mult: int = 0
     hc_sinkhorn_iters: int = 0
     hc_eps: float = 0.0
+    mhc: bool = False
+    num_nextn_predict_layers: int = 0
     expert_dtype: str = ""
     dspark_block_size: int = 0
     dspark_noise_token_id: int = 0
@@ -592,6 +604,9 @@ class ModelConfig:
     linear_num_key_heads: int = 16     # number of key heads in linear attention
     linear_value_head_dim: int = 128   # per-head dim for values in linear attention
     linear_num_value_heads: int = 32   # number of value heads in linear attention
+    linear_gate_lower_bound: Optional[float] = None
+    linear_kda_layers: Optional[List[int]] = None
+    linear_full_attention_layers: Optional[List[int]] = None
 
     # MoE
     n_routed_experts: int = 0
@@ -604,6 +619,7 @@ class ModelConfig:
     topk_method: str = "greedy"           # "noaux_tc"
     norm_topk_prob: bool = True
     moe_layer_indices: Optional[List[int]] = None
+    mlp_layer_types: Optional[List[str]] = None
     use_moe_router_bias: bool = False
     need_fp32_gate: bool = False
 
@@ -707,10 +723,15 @@ class ModelConfig:
         # Model architecture type
         arch = cfg.get("model_type", "")
         is_deepseek_v4 = arch == "deepseek_v4"
+        is_glm5_next = arch == "glm5_next_text"
         # DeepSeek-V4 is neither legacy MLA nor GQA: it has a single latent KV
         # vector plus compressed/indexed sparse attention and a low-rank output.
         is_mla = "kv_lora_rank" in cfg and not is_deepseek_v4
         step3_text = arch in ("step3p5", "step3p7")
+
+        raw_linear_attn = cfg.get("linear_attn_config", {}) or {}
+        if not isinstance(raw_linear_attn, dict):
+            raise ValueError("linear_attn_config must be an object when present")
 
         # Handle first_k_dense_replace from either field or decoder_sparse_step
         if "first_k_dense_replace" in cfg:
@@ -729,6 +750,14 @@ class ModelConfig:
         index_n_heads = int(cfg.get("index_n_heads", 0) or 0)
         index_topk_freq = int(cfg.get("index_topk_freq", 0) or 0)
         index_skip_topk_offset = int(cfg.get("index_skip_topk_offset", 0) or 0)
+        index_kpool = int(cfg.get("index_kpool", 0) or 0)
+        index_kpool_compress = bool(
+            cfg.get("index_kpool_compress", is_glm5_next)
+        )
+        index_kpool_always_select_tail = bool(
+            cfg.get("index_kpool_always_select_tail", False)
+        )
+        mla_use_nope = bool(cfg.get("mla_use_nope", False))
         raw_indexer_types = cfg.get("indexer_types")
         if raw_indexer_types is None:
             indexer_types = None
@@ -761,6 +790,10 @@ class ModelConfig:
         hc_mult = int(cfg.get("hc_mult", 0) or 0)
         hc_sinkhorn_iters = int(cfg.get("hc_sinkhorn_iters", 0) or 0)
         hc_eps = float(cfg.get("hc_eps", 0.0) or 0.0)
+        mhc = bool(cfg.get("mhc", False))
+        num_nextn_predict_layers = int(
+            cfg.get("num_nextn_predict_layers", 0) or 0
+        )
         expert_dtype = str(cfg.get("expert_dtype", "") or "")
         dspark_block_size = int(cfg.get("dspark_block_size", 0) or 0)
         dspark_noise_token_id = int(cfg.get("dspark_noise_token_id", 0) or 0)
@@ -944,13 +977,28 @@ class ModelConfig:
             assert len(layer_types) == num_layers, (
                 f"layers_block_type length {len(layer_types)} != num_hidden_layers {num_layers}")
         elif "layer_types" in cfg:
-            # GPT OSS: explicit layer_types array (sliding_attention / full_attention)
+            # Explicit per-layer schedule. GLM-5.3 names its sparse MLA blocks
+            # "deepseek_sparse_attention"; Krasis uses "full_attention" as the
+            # internal executable-attention label.
             layer_types = list(cfg["layer_types"])
             if len(layer_types) > num_layers and step3_text:
                 # Step includes MTP/extra layers after the normal CausalLM text stack.
                 layer_types = layer_types[:num_layers]
             if len(layer_types) < num_layers:
                 raise ValueError(f"layer_types length {len(layer_types)} < num_hidden_layers {num_layers}")
+            if is_glm5_next:
+                glm_type_map = {
+                    "linear_attention": "linear_attention",
+                    "deepseek_sparse_attention": "full_attention",
+                    "full_attention": "full_attention",
+                }
+                invalid = sorted(set(layer_types) - set(glm_type_map))
+                if invalid:
+                    raise ValueError(
+                        "glm5_next_text layer_types contains unsupported values: "
+                        + ", ".join(invalid)
+                    )
+                layer_types = [glm_type_map[value] for value in layer_types]
         elif full_attn_interval > 0:
             # Qwen3-Next: compute from full_attention_interval
             layer_types = [
@@ -958,6 +1006,207 @@ class ModelConfig:
                 else "linear_attention"
                 for i in range(num_layers)
             ]
+
+        linear_head_dim = int(
+            raw_linear_attn.get(
+                "head_dim", cfg.get("linear_key_head_dim", 128)
+            )
+        )
+        linear_num_heads = int(
+            raw_linear_attn.get(
+                "num_heads", cfg.get("linear_num_key_heads", 16)
+            )
+        )
+        linear_conv_kernel_dim = int(
+            raw_linear_attn.get(
+                "short_conv_kernel_size",
+                cfg.get("linear_conv_kernel_dim", 4),
+            )
+        )
+        raw_linear_lower_bound = raw_linear_attn.get("gate_lower_bound")
+        linear_gate_lower_bound = (
+            None
+            if raw_linear_lower_bound is None
+            else float(raw_linear_lower_bound)
+        )
+        linear_kda_layers = _parse_int_list(
+            raw_linear_attn.get("kda_layers"),
+            "linear_attn_config.kda_layers",
+            max_len=num_layers,
+        )
+        linear_full_attention_layers = _parse_int_list(
+            raw_linear_attn.get("full_attn_layers"),
+            "linear_attn_config.full_attn_layers",
+            max_len=num_layers,
+        )
+
+        raw_mlp_layer_types = cfg.get("mlp_layer_types") if is_glm5_next else None
+        if raw_mlp_layer_types is None:
+            mlp_layer_types = None
+        elif not isinstance(raw_mlp_layer_types, list):
+            raise ValueError("mlp_layer_types must be an array when present")
+        else:
+            mlp_layer_types = [str(value) for value in raw_mlp_layer_types]
+            if len(mlp_layer_types) != num_layers:
+                raise ValueError(
+                    f"mlp_layer_types length {len(mlp_layer_types)} "
+                    f"!= num_hidden_layers {num_layers}"
+                )
+
+        if is_glm5_next:
+            if layer_types is None or len(layer_types) != num_layers:
+                actual_len = 0 if layer_types is None else len(layer_types)
+                raise ValueError(
+                    "glm5_next_text layer_types length "
+                    f"{actual_len} != num_hidden_layers {num_layers}"
+                )
+            expected_kda = [
+                idx for idx, value in enumerate(layer_types)
+                if value == "linear_attention"
+            ]
+            expected_sparse = [
+                idx for idx, value in enumerate(layer_types)
+                if value == "full_attention"
+            ]
+            if not expected_kda or not expected_sparse:
+                raise ValueError(
+                    "glm5_next_text requires both KDA and sparse-MLA layers"
+                )
+            if linear_kda_layers != expected_kda:
+                raise ValueError(
+                    "glm5_next_text linear_attn_config.kda_layers does not "
+                    "match layer_types"
+                )
+            if linear_full_attention_layers != expected_sparse:
+                raise ValueError(
+                    "glm5_next_text linear_attn_config.full_attn_layers does "
+                    "not match layer_types"
+                )
+
+            # GLM-5.3-Flash publishes a regular KDA/KDA/KDA/DSA schedule.
+            # Derive the legacy DSA cadence only after proving that schedule;
+            # never guess it from the model name.
+            derived_freq = expected_sparse[0] + 1
+            if derived_freq <= 0 or expected_sparse != list(
+                range(derived_freq - 1, num_layers, derived_freq)
+            ):
+                raise ValueError(
+                    "glm5_next_text sparse-MLA layers must follow a regular "
+                    "KDA-to-DSA cadence"
+                )
+            if index_topk_freq not in (0, derived_freq):
+                raise ValueError(
+                    f"glm5_next_text index_topk_freq {index_topk_freq} does "
+                    f"not match derived cadence {derived_freq}"
+                )
+            index_topk_freq = derived_freq
+
+            required_positive = {
+                "q_lora_rank": int(cfg.get("q_lora_rank", 0) or 0),
+                "kv_lora_rank": int(cfg.get("kv_lora_rank", 0) or 0),
+                "qk_nope_head_dim": int(
+                    cfg.get("qk_nope_head_dim", 0) or 0
+                ),
+                "v_head_dim": int(cfg.get("v_head_dim", 0) or 0),
+                "index_topk": index_topk,
+                "index_head_dim": index_head_dim,
+                "index_n_heads": index_n_heads,
+                "index_kpool": index_kpool,
+                "linear_attn_config.num_heads": linear_num_heads,
+                "linear_attn_config.head_dim": linear_head_dim,
+                "linear_attn_config.short_conv_kernel_size": linear_conv_kernel_dim,
+                "hc_mult": hc_mult,
+                "hc_sinkhorn_iters": hc_sinkhorn_iters,
+            }
+            for field_name, value in required_positive.items():
+                if value <= 0:
+                    raise ValueError(
+                        f"glm5_next_text requires positive {field_name}, got {value}"
+                    )
+            if int(cfg.get("qk_rope_head_dim", -1)) != 0 or not mla_use_nope:
+                raise ValueError(
+                    "glm5_next_text requires rope-free MLA "
+                    "(qk_rope_head_dim=0 and mla_use_nope=true)"
+                )
+            if linear_gate_lower_bound is None or linear_gate_lower_bound >= 0.0:
+                raise ValueError(
+                    "glm5_next_text requires a negative KDA gate_lower_bound"
+                )
+            if index_topk % index_kpool != 0:
+                raise ValueError(
+                    f"glm5_next_text index_topk {index_topk} is not divisible "
+                    f"by index_kpool {index_kpool}"
+                )
+            if not index_kpool_compress:
+                raise ValueError(
+                    "glm5_next_text requires index_kpool_compress=true"
+                )
+            if not index_kpool_always_select_tail:
+                raise ValueError(
+                    "glm5_next_text requires index_kpool_always_select_tail=true"
+                )
+            if not mhc or hc_eps <= 0.0:
+                raise ValueError(
+                    "glm5_next_text requires mHC with positive hc_eps"
+                )
+            if num_nextn_predict_layers != 1:
+                raise ValueError(
+                    "glm5_next_text requires exactly one published MTP layer"
+                )
+            if int(cfg["num_attention_heads"]) != int(
+                cfg.get("num_key_value_heads", 0)
+            ):
+                raise ValueError(
+                    "glm5_next_text num_attention_heads must equal "
+                    "num_key_value_heads"
+                )
+            if indexer_types is None or len(indexer_types) != num_layers:
+                actual_len = 0 if indexer_types is None else len(indexer_types)
+                raise ValueError(
+                    "glm5_next_text indexer_types length "
+                    f"{actual_len} != num_hidden_layers {num_layers}"
+                )
+            invalid_indexer_types = sorted(
+                {value for value in indexer_types if value not in ("full", "shared")}
+            )
+            if invalid_indexer_types:
+                raise ValueError(
+                    "glm5_next_text indexer_types contains unsupported values: "
+                    + ", ".join(invalid_indexer_types)
+                )
+            full_sparse_owner_seen = False
+            for layer_idx in expected_sparse:
+                if indexer_types[layer_idx] == "full":
+                    full_sparse_owner_seen = True
+                elif not full_sparse_owner_seen:
+                    raise ValueError(
+                        "glm5_next_text shared sparse indexer at layer "
+                        f"{layer_idx} has no preceding sparse owner"
+                    )
+            if mlp_layer_types is None:
+                raise ValueError("glm5_next_text requires mlp_layer_types")
+            invalid_mlp_types = sorted(
+                set(mlp_layer_types) - {"dense", "sparse"}
+            )
+            if invalid_mlp_types:
+                raise ValueError(
+                    "glm5_next_text mlp_layer_types contains unsupported values: "
+                    + ", ".join(invalid_mlp_types)
+                )
+            if any(
+                (value == "sparse") != (idx >= first_k_dense)
+                for idx, value in enumerate(mlp_layer_types)
+            ):
+                raise ValueError(
+                    "glm5_next_text mlp_layer_types does not match "
+                    "first_k_dense_replace"
+                )
+            if cfg.get("scoring_func") != "sigmoid":
+                raise ValueError("glm5_next_text requires scoring_func='sigmoid'")
+            if cfg.get("topk_method") != "noaux_tc":
+                raise ValueError("glm5_next_text requires topk_method='noaux_tc'")
+            if int(cfg.get("n_shared_experts", 0) or 0) != 1:
+                raise ValueError("glm5_next_text requires exactly one shared expert")
 
         # Norm convention: Qwen3NextRMSNorm uses (1 + weight) * x
         # with weight initialized to zeros, while standard models use weight * x
@@ -998,7 +1247,9 @@ class ModelConfig:
         sliding_window = cfg.get("sliding_window", 0)
 
         # Pre-quantized expert format (GPT OSS uses MXFP4)
-        quant_config = cfg.get("quantization_config", {})
+        quant_config = cfg.get(
+            "quantization_config", raw.get("quantization_config", {})
+        )
         expert_quant_method = (
             expert_dtype if is_deepseek_v4 else quant_config.get("quant_method", "")
         )
@@ -1079,6 +1330,10 @@ class ModelConfig:
             indexer_types=indexer_types,
             indexer_rope_interleave=indexer_rope_interleave,
             index_share_for_mtp_iteration=index_share_for_mtp_iteration,
+            index_kpool=index_kpool,
+            index_kpool_compress=index_kpool_compress,
+            index_kpool_always_select_tail=index_kpool_always_select_tail,
+            mla_use_nope=mla_use_nope,
             attention_head_dim=attention_head_dim,
             o_lora_rank=o_lora_rank,
             o_groups=o_groups,
@@ -1088,6 +1343,8 @@ class ModelConfig:
             hc_mult=hc_mult,
             hc_sinkhorn_iters=hc_sinkhorn_iters,
             hc_eps=hc_eps,
+            mhc=mhc,
+            num_nextn_predict_layers=num_nextn_predict_layers,
             expert_dtype=expert_dtype,
             dspark_block_size=dspark_block_size,
             dspark_noise_token_id=dspark_noise_token_id,
@@ -1104,11 +1361,22 @@ class ModelConfig:
             # Hybrid model
             full_attention_interval=full_attn_interval,
             layer_types=layer_types,
-            linear_conv_kernel_dim=cfg.get("linear_conv_kernel_dim", 4),
-            linear_key_head_dim=cfg.get("linear_key_head_dim", 128),
-            linear_num_key_heads=cfg.get("linear_num_key_heads", 16),
-            linear_value_head_dim=cfg.get("linear_value_head_dim", 128),
-            linear_num_value_heads=cfg.get("linear_num_value_heads", 32),
+            linear_conv_kernel_dim=linear_conv_kernel_dim,
+            linear_key_head_dim=linear_head_dim,
+            linear_num_key_heads=linear_num_heads,
+            linear_value_head_dim=(
+                linear_head_dim
+                if is_glm5_next
+                else cfg.get("linear_value_head_dim", 128)
+            ),
+            linear_num_value_heads=(
+                linear_num_heads
+                if is_glm5_next
+                else cfg.get("linear_num_value_heads", 32)
+            ),
+            linear_gate_lower_bound=linear_gate_lower_bound,
+            linear_kda_layers=linear_kda_layers,
+            linear_full_attention_layers=linear_full_attention_layers,
             # MoE
             n_routed_experts=n_experts,
             num_experts_per_tok=experts_per_tok,
@@ -1122,8 +1390,12 @@ class ModelConfig:
             topk_method=cfg.get("topk_method", "greedy"),
             norm_topk_prob=cfg.get("norm_topk_prob", cfg.get("norm_expert_weight", True)),
             moe_layer_indices=moe_layer_indices,
+            mlp_layer_types=mlp_layer_types,
             use_moe_router_bias=bool(cfg.get("use_moe_router_bias", False)),
-            need_fp32_gate=bool(cfg.get("need_fp32_gate", False)),
+            need_fp32_gate=bool(
+                cfg.get("need_fp32_gate", False)
+                or cfg.get("moe_router_dtype") == "float32"
+            ),
             rms_norm_eps=float(rms_norm_eps),
             hidden_act=cfg.get("hidden_activation", cfg.get("hidden_act", "silu")),
             rope_theta=rope_theta,
@@ -1189,9 +1461,14 @@ class ModelConfig:
         return self.model_type == "deepseek_v4"
 
     @property
+    def is_glm5_next(self) -> bool:
+        """True for the GLM-5.3 hybrid KDA/sparse-MLA text tower."""
+        return self.model_type == "glm5_next_text"
+
+    @property
     def is_dsa(self) -> bool:
         """True when the model uses DSA sparse attention and IndexShare."""
-        return self.model_type == "glm_moe_dsa"
+        return self.model_type in ("glm_moe_dsa", "glm5_next_text")
 
     def dsa_indexer_owner_layer(self, layer_idx: int) -> Optional[int]:
         """Return the full-indexer layer that owns this layer's IndexShare state."""
@@ -1201,9 +1478,13 @@ class ModelConfig:
             )
         if not self.is_dsa:
             return None
+        if self.is_glm5_next and self.is_linear_attention_layer(layer_idx):
+            return None
         if self.indexer_types is None:
             raise RuntimeError("DSA model has no validated indexer_types schedule")
         for owner_idx in range(layer_idx, -1, -1):
+            if self.is_glm5_next and self.is_linear_attention_layer(owner_idx):
+                continue
             if self.indexer_types[owner_idx] == "full":
                 return owner_idx
         raise RuntimeError(
@@ -1384,6 +1665,8 @@ class ModelConfig:
         return self.mamba_d_inner + 2 * self.mamba_n_groups * self.ssm_state_size
 
     def is_moe_layer(self, layer_idx: int) -> bool:
+        if self.mlp_layer_types is not None:
+            return self.mlp_layer_types[layer_idx] == "sparse"
         if self.moe_layer_indices is not None:
             return layer_idx in self.moe_layer_indices
         if self.is_nemotron_h:

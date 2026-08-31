@@ -98,6 +98,19 @@ class NativeDsaIndexerWeights:
             "k_norm_weight": (cfg.index_head_dim,),
             "k_norm_bias": (cfg.index_head_dim,),
         }
+        if cfg.is_glm5_next:
+            expected_shapes.update(
+                {
+                    "index_kpool_compress_ape": (
+                        cfg.index_kpool,
+                        cfg.index_head_dim,
+                    ),
+                    "index_kpool_compress_gate": (
+                        cfg.index_head_dim,
+                        cfg.hidden_size,
+                    ),
+                }
+            )
         missing = sorted(set(expected_shapes) - set(weights))
         if missing:
             raise KeyError(
@@ -212,6 +225,128 @@ class NativeMLAWeights:
     def forward(self, *_args, **_kwargs):
         raise RuntimeError(
             "MLA inference must run through the native Rust/CUDA runtime"
+        )
+
+
+class NativeHyperConnectionWeights:
+    """Validated mHC weights and architecture oracle for GLM-5.3.
+
+    Production execution belongs to Rust/CUDA, but retaining the exact small
+    reference here lets registration and native kernels be checked against one
+    unambiguous implementation.
+    """
+
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        layer_idx: int,
+        tensors: Dict[str, torch.Tensor],
+    ):
+        if not (cfg.is_glm5_next or cfg.is_deepseek_v4):
+            raise ValueError("mHC weights used for an unsupported architecture")
+        mix_width = (2 + cfg.hc_mult) * cfg.hc_mult
+        hc_input = cfg.hc_mult * cfg.hidden_size
+        expected = {
+            "hc_attn_fn": (mix_width, hc_input),
+            "hc_attn_base": (mix_width,),
+            "hc_attn_scale": (3,),
+            "hc_ffn_fn": (mix_width, hc_input),
+            "hc_ffn_base": (mix_width,),
+            "hc_ffn_scale": (3,),
+        }
+        missing = sorted(set(expected) - set(tensors))
+        if missing:
+            raise KeyError(
+                f"mHC layer {layer_idx} is missing tensors: "
+                + ", ".join(missing)
+            )
+        for name, shape in expected.items():
+            tensor = tensors[name]
+            if tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"mHC layer {layer_idx} {name} shape "
+                    f"{tuple(tensor.shape)} != {shape}"
+                )
+            if tensor.dtype != torch.float32:
+                raise ValueError(
+                    f"mHC layer {layer_idx} {name} dtype "
+                    f"{tensor.dtype} != torch.float32"
+                )
+        self.layer_idx = layer_idx
+        self.cfg = cfg
+        self.tensors = tensors
+
+    def _prepare(
+        self,
+        hidden_streams: torch.Tensor,
+        site: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if site not in ("attn", "ffn"):
+            raise ValueError(f"unsupported mHC site {site!r}")
+        expected = (
+            self.cfg.hc_mult,
+            self.cfg.hidden_size,
+        )
+        if hidden_streams.ndim != 3 or tuple(hidden_streams.shape[-2:]) != expected:
+            raise ValueError(
+                f"mHC layer {self.layer_idx} input shape "
+                f"{tuple(hidden_streams.shape)} must end in {expected}"
+            )
+
+        hc = self.cfg.hc_mult
+        flat = hidden_streams.float().flatten(start_dim=-2)
+        flat = flat * torch.rsqrt(
+            flat.square().mean(dim=-1, keepdim=True)
+            + self.cfg.rms_norm_eps
+        )
+        logits = torch.nn.functional.linear(
+            flat,
+            self.tensors[f"hc_{site}_fn"],
+        )
+        pre_w, post_w, comb_w = logits.split([hc, hc, hc * hc], dim=-1)
+        pre_b, post_b, comb_b = self.tensors[f"hc_{site}_base"].split(
+            [hc, hc, hc * hc]
+        )
+        pre_scale, post_scale, comb_scale = self.tensors[
+            f"hc_{site}_scale"
+        ].unbind(0)
+
+        pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.cfg.hc_eps
+        post = 2.0 * torch.sigmoid(post_w * post_scale + post_b)
+        comb_logits = (
+            comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale
+            + comb_b.view(hc, hc)
+        )
+        comb = torch.softmax(comb_logits, dim=-1) + self.cfg.hc_eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.cfg.hc_eps)
+        for _ in range(self.cfg.hc_sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.cfg.hc_eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.cfg.hc_eps)
+
+        collapsed = (pre.unsqueeze(-1) * hidden_streams.float()).sum(dim=-2)
+        return post, comb, collapsed.to(hidden_streams.dtype)
+
+    def prepare_attn(
+        self, hidden_streams: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._prepare(hidden_streams, "attn")
+
+    def prepare_ffn(
+        self, hidden_streams: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._prepare(hidden_streams, "ffn")
+
+    @staticmethod
+    def apply(
+        residual_streams: torch.Tensor,
+        sublayer_output: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        dtype = residual_streams.dtype
+        return (
+            post.to(dtype).unsqueeze(-1) * sublayer_output.unsqueeze(-2)
+            + torch.matmul(comb.to(dtype).transpose(-1, -2), residual_streams)
         )
 
 
@@ -389,6 +524,15 @@ class TransformerLayer:
         self.device = device
         self.is_moe = weights["is_moe"]
         self.layer_type = weights.get("layer_type", "full_attention")
+        self.hyper_connection = (
+            NativeHyperConnectionWeights(
+                cfg,
+                layer_idx,
+                weights["hyper_connection"],
+            )
+            if cfg.is_glm5_next
+            else None
+        )
 
         # Layer norms (BF16)
         self.input_norm_weight = weights["norms"]["input_layernorm"]
@@ -413,8 +557,22 @@ class TransformerLayer:
             self.attention = None
             self.mamba2_weights = None
         elif self.layer_type == "linear_attention":
-            from krasis.linear_attention import GatedDeltaNetAttention
-            self.attention = GatedDeltaNetAttention(cfg, layer_idx, weights["linear_attention"], device)
+            if cfg.is_glm5_next:
+                from krasis.linear_attention import KimiDeltaAttention
+                self.attention = KimiDeltaAttention(
+                    cfg,
+                    layer_idx,
+                    weights["linear_attention"],
+                    device,
+                )
+            else:
+                from krasis.linear_attention import GatedDeltaNetAttention
+                self.attention = GatedDeltaNetAttention(
+                    cfg,
+                    layer_idx,
+                    weights["linear_attention"],
+                    device,
+                )
             self.mamba2_weights = None
         elif cfg.is_deepseek_v4:
             self.attention = NativeDeepseekV4Weights(

@@ -315,6 +315,24 @@ class WeightLoader:
                 logger.warning("FP8 tensor %s has no scale_inv — raw conversion only", name)
                 return w.to(torch.bfloat16)
             scale_inv = self._read_tensor(scale_name).float()
+            if scale_inv.ndim == 2:
+                if w.ndim != 2:
+                    raise ValueError(
+                        f"FP8 block dequant requires a rank-2 weight; "
+                        f"got {name} {tuple(w.shape)} and {scale_name} "
+                        f"{tuple(scale_inv.shape)}"
+                    )
+                block_rows = (w.shape[0] + 127) // 128
+                block_cols = (w.shape[1] + 127) // 128
+                if tuple(scale_inv.shape) != (block_rows, block_cols):
+                    raise ValueError(
+                        f"FP8 scale {scale_name} shape {tuple(scale_inv.shape)} "
+                        f"!= expected {(block_rows, block_cols)} for "
+                        f"{tuple(w.shape)} and 128x128 source blocks"
+                    )
+                scale_inv = scale_inv.repeat_interleave(128, 0)
+                scale_inv = scale_inv.repeat_interleave(128, 1)
+                scale_inv = scale_inv[: w.shape[0], : w.shape[1]]
             w = w.to(torch.float32) * scale_inv
             return w.to(torch.bfloat16)
         return w.to(torch.bfloat16)
@@ -546,9 +564,10 @@ class WeightLoader:
             }
         return result
 
-    def load_deepseek_v4_hyper_connection(
+    def load_hyper_connection(
         self, layer_idx: int, device: torch.device
     ) -> Dict[str, torch.Tensor]:
+        """Load the shared mHC tensor contract used by DeepSeek-V4 and GLM-5.3."""
         prefix = self.cfg.layer_tensor_prefix(layer_idx)
         return {
             name: self._load_f32(f"{prefix}.{name}", device)
@@ -561,6 +580,12 @@ class WeightLoader:
                 "hc_ffn_scale",
             )
         }
+
+    def load_deepseek_v4_hyper_connection(
+        self, layer_idx: int, device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Backward-compatible name for the architecture-neutral mHC loader."""
+        return self.load_hyper_connection(layer_idx, device)
 
     def load_deepseek_v4_hc_head(
         self, device: torch.device
@@ -785,7 +810,12 @@ class WeightLoader:
         layer_idx: int,
         device: torch.device,
     ) -> Dict[str, torch.Tensor]:
-        """Load the five checkpoint tensors owned by one full DSA indexer."""
+        """Load checkpoint tensors owned by one full DSA indexer.
+
+        Legacy GLM DSA owns five projection/norm tensors. GLM-5.3 adds the
+        learned positional offsets and compression gate used by four-token
+        k-pools.
+        """
         if not self.cfg.is_dsa_indexer_owner_layer(layer_idx):
             owner_idx = self.cfg.dsa_indexer_owner_layer(layer_idx)
             raise ValueError(
@@ -803,6 +833,17 @@ class WeightLoader:
             "k_norm_weight": f"{prefix}.k_norm.weight",
             "k_norm_bias": f"{prefix}.k_norm.bias",
         }
+        if self.cfg.is_glm5_next:
+            tensor_names.update(
+                {
+                    "index_kpool_compress_ape": (
+                        f"{prefix}.index_kpool_compress_ape"
+                    ),
+                    "index_kpool_compress_gate": (
+                        f"{prefix}.index_kpool_compress_gate"
+                    ),
+                }
+            )
         missing = [
             tensor_name
             for tensor_name in tensor_names.values()
@@ -1015,8 +1056,9 @@ class WeightLoader:
         else:
             prefix = prefix_router
             weight_name = f"{prefix}.weight"
+        gate_loader = self._load_f32 if self.cfg.need_fp32_gate else self._load_bf16
         result = {
-            "weight": self._load_bf16(weight_name, device),
+            "weight": gate_loader(weight_name, device),
         }
         # Router bias (GPT OSS)
         bias_name = f"{prefix}.bias"
@@ -1025,7 +1067,12 @@ class WeightLoader:
         # e_score_correction_bias (Kimi K2.5)
         corr_name = f"{prefix}.e_score_correction_bias"
         if corr_name in self._weight_map:
-            result["e_score_correction_bias"] = self._load_bf16(corr_name, device)
+            correction_loader = (
+                self._load_f32 if self.cfg.need_fp32_gate else self._load_bf16
+            )
+            result["e_score_correction_bias"] = correction_loader(
+                corr_name, device
+            )
         step_router_bias = f"{self.cfg.layers_prefix}.layers.{layer_idx}.moe.router_bias"
         if step_router_bias in self._weight_map:
             result["e_score_correction_bias"] = self._load_bf16(step_router_bias, device)
@@ -1095,6 +1142,9 @@ class WeightLoader:
         Loads: in_proj_qkvz, in_proj_ba, out_proj (quantizable),
                conv1d.weight, A_log, dt_bias, norm.weight (always BF16).
         """
+        if self.cfg.is_glm5_next:
+            return self._load_glm5_next_kda_weights(layer_idx, device)
+
         prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.linear_attn"
         weights = {}
         # Attention weights always loaded as BF16 — adaptive FP8 conversion
@@ -1150,6 +1200,72 @@ class WeightLoader:
             f"{prefix}.norm.weight",
         )
 
+        return weights
+
+    def _load_glm5_next_kda_weights(
+        self, layer_idx: int, device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Load one GLM-5.3 Kimi Delta Attention layer without remapping math.
+
+        GLM-5.3 stores KDA under ``self_attn`` with separate Q/K/V projections,
+        separate depthwise convolutions, per-dimension forget/output gates, and
+        a sigmoid-gated output norm. Those tensors are intentionally retained
+        under architecture-native names instead of being coerced into Qwen's
+        Gated DeltaNet fused layout.
+        """
+        if not self.cfg.is_linear_attention_layer(layer_idx):
+            raise ValueError(
+                f"GLM-5.3 layer {layer_idx} is not a KDA layer"
+            )
+        prefix = f"{self.cfg.layer_tensor_prefix(layer_idx)}.self_attn"
+        bf16_names = {
+            "q_proj": "q_proj.weight",
+            "k_proj": "k_proj.weight",
+            "v_proj": "v_proj.weight",
+            "q_conv1d": "q_conv1d.weight",
+            "k_conv1d": "k_conv1d.weight",
+            "v_conv1d": "v_conv1d.weight",
+            "f_a_proj": "f_a_proj.weight",
+            "f_b_proj": "f_b_proj.weight",
+            "b_proj": "b_proj.weight",
+            "g_a_proj": "g_a_proj.weight",
+            "g_b_proj": "g_b_proj.weight",
+            "o_norm": "o_norm.weight",
+            "o_proj": "o_proj.weight",
+        }
+        fp32_names = {
+            "A_log": "A_log",
+            "dt_bias": "dt_bias",
+        }
+        checkpoint_names = {
+            key: f"{prefix}.{suffix}"
+            for key, suffix in {**bf16_names, **fp32_names}.items()
+        }
+        missing = [
+            name for name in checkpoint_names.values()
+            if name not in self._weight_map
+        ]
+        if missing:
+            raise KeyError(
+                f"GLM-5.3 KDA layer {layer_idx} is missing checkpoint tensors: "
+                + ", ".join(missing)
+            )
+        weights = {
+            key: _timed_bf16_load(
+                self,
+                layer_idx=layer_idx,
+                tensor_name=checkpoint_names[key],
+                device=device,
+                step=f"glm5_next.kda.{key}",
+            )
+            for key in bf16_names
+        }
+        weights.update(
+            {
+                key: self._load_f32(checkpoint_names[key], device)
+                for key in fp32_names
+            }
+        )
         return weights
 
     def load_mamba2_weights(
@@ -1285,8 +1401,8 @@ class WeightLoader:
             "is_moe": self.cfg.is_moe_layer(layer_idx),
             "layer_type": layer_type,
         }
-        if self.cfg.is_deepseek_v4:
-            result["hyper_connection"] = self.load_deepseek_v4_hyper_connection(
+        if self.cfg.is_deepseek_v4 or self.cfg.is_glm5_next:
+            result["hyper_connection"] = self.load_hyper_connection(
                 layer_idx, device
             )
         norms_elapsed = time.perf_counter() - start

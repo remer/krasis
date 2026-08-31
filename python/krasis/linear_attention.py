@@ -142,6 +142,254 @@ def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     return x * inv_norm
 
 
+class KimiDeltaAttention:
+    """Correctness-first GLM-5.3 Kimi Delta Attention implementation.
+
+    This is the architecture oracle and setup object for the native path. It
+    deliberately uses the recurrent equation for both prefill and decode so
+    small reference tests have one unambiguous implementation. Long-prefill
+    production execution is registered separately with Rust/CUDA.
+    """
+
+    _BF16_WEIGHT_SHAPES = {
+        "q_proj": lambda cfg: (
+            cfg.linear_num_key_heads * cfg.linear_key_head_dim,
+            cfg.hidden_size,
+        ),
+        "k_proj": lambda cfg: (
+            cfg.linear_num_key_heads * cfg.linear_key_head_dim,
+            cfg.hidden_size,
+        ),
+        "v_proj": lambda cfg: (
+            cfg.linear_num_value_heads * cfg.linear_value_head_dim,
+            cfg.hidden_size,
+        ),
+        "q_conv1d": lambda cfg: (
+            cfg.linear_num_key_heads * cfg.linear_key_head_dim,
+            1,
+            cfg.linear_conv_kernel_dim,
+        ),
+        "k_conv1d": lambda cfg: (
+            cfg.linear_num_key_heads * cfg.linear_key_head_dim,
+            1,
+            cfg.linear_conv_kernel_dim,
+        ),
+        "v_conv1d": lambda cfg: (
+            cfg.linear_num_value_heads * cfg.linear_value_head_dim,
+            1,
+            cfg.linear_conv_kernel_dim,
+        ),
+        "f_a_proj": lambda cfg: (
+            cfg.linear_key_head_dim,
+            cfg.hidden_size,
+        ),
+        "f_b_proj": lambda cfg: (
+            cfg.linear_num_key_heads * cfg.linear_key_head_dim,
+            cfg.linear_key_head_dim,
+        ),
+        "b_proj": lambda cfg: (
+            cfg.linear_num_key_heads,
+            cfg.hidden_size,
+        ),
+        "g_a_proj": lambda cfg: (
+            cfg.linear_key_head_dim,
+            cfg.hidden_size,
+        ),
+        "g_b_proj": lambda cfg: (
+            cfg.linear_num_value_heads * cfg.linear_value_head_dim,
+            cfg.linear_key_head_dim,
+        ),
+        "o_norm": lambda cfg: (cfg.linear_value_head_dim,),
+        "o_proj": lambda cfg: (
+            cfg.hidden_size,
+            cfg.linear_num_value_heads * cfg.linear_value_head_dim,
+        ),
+    }
+
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        layer_idx: int,
+        weights: dict,
+        device: torch.device,
+    ):
+        if not cfg.is_glm5_next or not cfg.is_linear_attention_layer(layer_idx):
+            raise ValueError(
+                f"KDA weights cannot be attached to {cfg.model_type} layer {layer_idx}"
+            )
+        self.cfg = cfg
+        self.layer_idx = layer_idx
+        self.device = device
+        self.num_heads = cfg.linear_num_key_heads
+        self.head_dim = cfg.linear_key_head_dim
+        self.value_head_dim = cfg.linear_value_head_dim
+        self.qkv_dim = self.num_heads * self.head_dim
+        self.value_dim = cfg.linear_num_value_heads * self.value_head_dim
+        if self.num_heads != cfg.linear_num_value_heads:
+            raise ValueError("GLM-5.3 KDA requires equal Q/K/V head counts")
+        if self.head_dim != self.value_head_dim:
+            raise ValueError("GLM-5.3 KDA requires equal key/value head dimensions")
+        self.conv_dim = self.qkv_dim * 3
+        self.kernel_dim = cfg.linear_conv_kernel_dim
+        self.scale = self.head_dim ** -0.5
+        self.gate_lower_bound = cfg.linear_gate_lower_bound
+        if self.gate_lower_bound is None or self.gate_lower_bound >= 0.0:
+            raise ValueError("GLM-5.3 KDA requires a negative forget-gate bound")
+
+        expected = {
+            name: shape_fn(cfg)
+            for name, shape_fn in self._BF16_WEIGHT_SHAPES.items()
+        }
+        expected.update(
+            {
+                "A_log": (self.num_heads,),
+                "dt_bias": (self.qkv_dim,),
+            }
+        )
+        missing = sorted(set(expected) - set(weights))
+        if missing:
+            raise KeyError(
+                f"GLM-5.3 KDA layer {layer_idx} is missing tensors: "
+                + ", ".join(missing)
+            )
+        for name, shape in expected.items():
+            tensor = weights[name]
+            if tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"GLM-5.3 KDA layer {layer_idx} {name} shape "
+                    f"{tuple(tensor.shape)} != {shape}"
+                )
+            expected_dtype = (
+                torch.float32 if name in ("A_log", "dt_bias")
+                else torch.bfloat16
+            )
+            if tensor.dtype != expected_dtype:
+                raise ValueError(
+                    f"GLM-5.3 KDA layer {layer_idx} {name} dtype "
+                    f"{tensor.dtype} != {expected_dtype}"
+                )
+            setattr(self, name, tensor)
+
+        self._conv_weight = torch.cat(
+            [self.q_conv1d, self.k_conv1d, self.v_conv1d], dim=0
+        ).contiguous()
+        self._conv_state: Optional[torch.Tensor] = None
+        self._recurrent_state: Optional[torch.Tensor] = None
+
+    def reset_state(self):
+        self._conv_state = None
+        self._recurrent_state = None
+
+    def _init_state(self, batch_size: int = 1):
+        if batch_size != 1:
+            raise ValueError("Krasis GLM-5.3 KDA oracle currently supports batch size 1")
+        if self._conv_state is None:
+            self._conv_state = torch.zeros(
+                1,
+                self.conv_dim,
+                self.kernel_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+        if self._recurrent_state is None:
+            self._recurrent_state = torch.zeros(
+                1,
+                self.num_heads,
+                self.head_dim,
+                self.value_head_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+    def _project_and_convolve(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokens = hidden.shape[0]
+        mixed_qkv = torch.cat(
+            [
+                _linear(hidden, self.q_proj),
+                _linear(hidden, self.k_proj),
+                _linear(hidden, self.v_proj),
+            ],
+            dim=-1,
+        ).transpose(0, 1).unsqueeze(0)
+        conv_input = torch.cat([self._conv_state, mixed_qkv], dim=-1)
+        self._conv_state = conv_input[:, :, -self.kernel_dim :].clone()
+        convolved = F.conv1d(
+            conv_input.to(self._conv_weight.dtype),
+            self._conv_weight,
+            bias=None,
+            padding=0,
+            groups=self.conv_dim,
+        )[:, :, -tokens:]
+        convolved = F.silu(convolved).transpose(1, 2).squeeze(0)
+        query, key, value = torch.split(
+            convolved,
+            [self.qkv_dim, self.qkv_dim, self.value_dim],
+            dim=-1,
+        )
+        shape = (tokens, self.num_heads, self.head_dim)
+        return query.view(shape), key.view(shape), value.view(shape)
+
+    def _forget_gate(self, hidden: torch.Tensor) -> torch.Tensor:
+        projected = _linear(_linear(hidden, self.f_a_proj), self.f_b_proj)
+        raw = (projected.float() + self.dt_bias).view(
+            hidden.shape[0], self.num_heads, self.head_dim
+        )
+        decay_rate = self.A_log.exp().view(1, self.num_heads, 1)
+        return self.gate_lower_bound * torch.sigmoid(decay_rate * raw)
+
+    def _gated_rmsnorm(
+        self, hidden: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        input_dtype = hidden.dtype
+        value = hidden.float()
+        value = value * torch.rsqrt(
+            value.square().mean(dim=-1, keepdim=True) + self.cfg.rms_norm_eps
+        )
+        value = value * self.o_norm.float()
+        value = value * torch.sigmoid(gate.float())
+        return value.to(input_dtype)
+
+    def forward(self, hidden: torch.Tensor, is_decode: bool) -> torch.Tensor:
+        """Apply the exact recurrent KDA equation and retain continuation state."""
+        del is_decode  # The oracle intentionally uses one equation for both paths.
+        if hidden.ndim != 2 or hidden.shape[1] != self.cfg.hidden_size:
+            raise ValueError(
+                f"GLM-5.3 KDA input shape {tuple(hidden.shape)} must be "
+                f"[tokens, {self.cfg.hidden_size}]"
+            )
+        self._init_state()
+        query, key, value = self._project_and_convolve(hidden)
+        query = _l2norm(query.float(), dim=-1) * self.scale
+        key = _l2norm(key.float(), dim=-1)
+        value = value.float()
+        forget = self._forget_gate(hidden)
+        beta = torch.sigmoid(_linear(hidden, self.b_proj).float())
+        output_gate = _linear(_linear(hidden, self.g_a_proj), self.g_b_proj)
+        output_gate = output_gate.view(
+            hidden.shape[0], self.num_heads, self.value_head_dim
+        )
+
+        outputs = []
+        for token_idx in range(hidden.shape[0]):
+            q_t = query[token_idx]
+            k_t = key[token_idx]
+            v_t = value[token_idx]
+            decay = forget[token_idx].exp().unsqueeze(-1)
+            self._recurrent_state.mul_(decay.unsqueeze(0))
+            state = self._recurrent_state.squeeze(0)
+            memory = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+            delta = (v_t - memory) * beta[token_idx].unsqueeze(-1)
+            state.add_(k_t.unsqueeze(-1) * delta.unsqueeze(-2))
+            outputs.append((state * q_t.unsqueeze(-1)).sum(dim=-2))
+
+        attention = torch.stack(outputs, dim=0)
+        attention = self._gated_rmsnorm(attention, output_gate)
+        attention = attention.reshape(hidden.shape[0], self.value_dim)
+        return _linear(attention.to(torch.bfloat16), self.o_proj)
+
+
 class GatedDeltaNetAttention:
     """Gated DeltaNet linear attention for one layer.
 

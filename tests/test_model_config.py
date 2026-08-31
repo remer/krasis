@@ -18,9 +18,11 @@ from krasis.kv_cache import MLA_CKV_KERNEL_MIN_DIM, PagedKVCache
 from krasis.layer import (
     NativeDeepseekV4Weights,
     NativeDsaIndexerWeights,
+    NativeHyperConnectionWeights,
     NativeMLAWeights,
     TransformerLayer,
 )
+from krasis.linear_attention import KimiDeltaAttention
 from krasis.model import (
     KrasisModel,
     _apply_max_context_limit,
@@ -81,6 +83,114 @@ def _glm_dsa_config() -> dict:
         "indexer_rope_interleave": True,
         "index_share_for_mtp_iteration": True,
     }
+
+
+def _glm5_next_config(num_layers: int = 8) -> dict:
+    sparse_layers = list(range(3, num_layers, 4))
+    kda_layers = [idx for idx in range(num_layers) if idx not in sparse_layers]
+    layer_types = [
+        "deepseek_sparse_attention" if idx in sparse_layers
+        else "linear_attention"
+        for idx in range(num_layers)
+    ]
+    return {
+        "model_type": "glm5_next",
+        "architectures": ["Glm5NextForConditionalGeneration"],
+        "quantization_config": {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+        "text_config": {
+            "model_type": "glm5_next_text",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "moe_intermediate_size": 2048,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 64,
+            "vocab_size": 154880,
+            "q_lora_rank": 1536,
+            "kv_lora_rank": 512,
+            "qk_nope_head_dim": 256,
+            "qk_rope_head_dim": 0,
+            "v_head_dim": 256,
+            "mla_use_nope": True,
+            "n_routed_experts": 288,
+            "num_experts_per_tok": 8,
+            "n_shared_experts": 1,
+            "first_k_dense_replace": 3,
+            "routed_scaling_factor": 2.5,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "norm_topk_prob": True,
+            "moe_router_dtype": "float32",
+            "swiglu_limit": 10.0,
+            "index_topk": 2048,
+            "index_head_dim": 128,
+            "index_n_heads": 32,
+            "index_kpool": 4,
+            "index_kpool_compress": True,
+            "index_kpool_always_select_tail": True,
+            "indexer_types": ["full"] * num_layers,
+            "indexer_rope_interleave": True,
+            "index_share_for_mtp_iteration": True,
+            "layer_types": layer_types,
+            "linear_attn_config": {
+                "num_heads": 64,
+                "head_dim": 128,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+                "kda_layers": kda_layers,
+                "full_attn_layers": sparse_layers,
+            },
+            "mlp_layer_types": ["dense"] * 3
+            + ["sparse"] * (num_layers - 3),
+            "mhc": True,
+            "hc_mult": 4,
+            "hc_sinkhorn_iters": 20,
+            "hc_eps": 1e-6,
+            "num_nextn_predict_layers": 1,
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 1_048_576,
+            "tie_word_embeddings": False,
+        },
+    }
+
+
+def _tiny_glm5_next_config() -> dict:
+    raw = _glm5_next_config(num_layers=4)
+    cfg = raw["text_config"]
+    cfg.update(
+        {
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "moe_intermediate_size": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "vocab_size": 32,
+            "q_lora_rank": 4,
+            "kv_lora_rank": 4,
+            "qk_nope_head_dim": 4,
+            "v_head_dim": 4,
+            "n_routed_experts": 4,
+            "num_experts_per_tok": 2,
+            "index_topk": 4,
+            "index_head_dim": 4,
+            "index_n_heads": 2,
+            "index_kpool": 2,
+            "hc_mult": 2,
+            "hc_sinkhorn_iters": 3,
+            "max_position_embeddings": 128,
+        }
+    )
+    cfg["linear_attn_config"].update(
+        {
+            "num_heads": 2,
+            "head_dim": 4,
+            "short_conv_kernel_size": 4,
+        }
+    )
+    return raw
 
 
 def _deepseek_v4_config() -> dict:
@@ -369,6 +479,40 @@ class ModelConfigContractTests(unittest.TestCase):
         with self.assertRaisesRegex(KeyError, r"has no block scale"):
             loader._read_and_dequant("layers.0.attn.wq_a.weight")
 
+    def test_glm5_next_fp8_dequant_uses_f32_block_scale_inv(self) -> None:
+        cfg = ModelConfig.from_model_path(
+            _write_config(self, _glm5_next_config())
+        )
+        weight = torch.tensor(
+            [[1.0] * 128 + [2.0], [0.5] * 128 + [-1.0]],
+            dtype=torch.float32,
+        ).to(torch.float8_e4m3fn)
+        scale = torch.tensor([[2.0, 4.0]], dtype=torch.float32)
+        tensors = {
+            "model.language_model.layers.3.mlp.experts.0.gate_proj.weight": weight,
+            "model.language_model.layers.3.mlp.experts.0.gate_proj.weight_scale_inv": scale,
+        }
+        loader = WeightLoader.__new__(WeightLoader)
+        loader.cfg = cfg
+        loader._weight_map = {name: "synthetic" for name in tensors}
+        loader._read_tensor = tensors.__getitem__
+
+        actual = loader._read_and_dequant(
+            "model.language_model.layers.3.mlp.experts.0.gate_proj.weight"
+        )
+        expected = weight.float()
+        expected[:, :128] *= 2.0
+        expected[:, 128:] *= 4.0
+        torch.testing.assert_close(actual.float(), expected, rtol=0, atol=0)
+
+        tensors[
+            "model.language_model.layers.3.mlp.experts.0.gate_proj.weight_scale_inv"
+        ] = torch.ones((2, 1), dtype=torch.float32)
+        with self.assertRaisesRegex(ValueError, r"shape .* != expected"):
+            loader._read_and_dequant(
+                "model.language_model.layers.3.mlp.experts.0.gate_proj.weight"
+            )
+
     def test_deepseek_v4_checkpoint_inventory_separates_mtp(self) -> None:
         cfg = ModelConfig.from_model_path(
             _write_config(self, _deepseek_v4_config())
@@ -581,6 +725,220 @@ class ModelConfigContractTests(unittest.TestCase):
             r"index_head_dim 62 is smaller than qk_rope_head_dim 64",
         ):
             ModelConfig.from_model_path(_write_config(self, raw))
+
+    def test_glm5_next_hybrid_architecture_contract(self) -> None:
+        cfg = ModelConfig.from_model_path(
+            _write_config(self, _glm5_next_config())
+        )
+
+        self.assertTrue(cfg.is_glm5_next)
+        self.assertTrue(cfg.is_mla)
+        self.assertTrue(cfg.is_dsa)
+        self.assertTrue(cfg.mla_use_nope)
+        self.assertEqual(cfg.qk_rope_head_dim, 0)
+        self.assertEqual(cfg.rotary_dim, 0)
+        self.assertEqual(cfg.layers_prefix, "model.language_model")
+        self.assertEqual(
+            cfg.layer_types,
+            [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+        )
+        self.assertEqual(cfg.linear_kda_layers, [0, 1, 2, 4, 5, 6])
+        self.assertEqual(cfg.linear_full_attention_layers, [3, 7])
+        self.assertEqual(cfg.linear_num_key_heads, 64)
+        self.assertEqual(cfg.linear_num_value_heads, 64)
+        self.assertEqual(cfg.linear_key_head_dim, 128)
+        self.assertEqual(cfg.linear_value_head_dim, 128)
+        self.assertEqual(cfg.linear_conv_kernel_dim, 4)
+        self.assertEqual(cfg.linear_gate_lower_bound, -5.0)
+        self.assertEqual(cfg.index_topk_freq, 4)
+        self.assertEqual(cfg.index_kpool, 4)
+        self.assertTrue(cfg.index_kpool_compress)
+        self.assertTrue(cfg.index_kpool_always_select_tail)
+        self.assertTrue(cfg.mhc)
+        self.assertEqual(cfg.hc_mult, 4)
+        self.assertEqual(cfg.num_nextn_predict_layers, 1)
+        self.assertEqual(cfg.num_full_attention_layers, 2)
+        self.assertEqual(
+            [cfg.dsa_indexer_owner_layer(idx) for idx in range(8)],
+            [None, None, None, 3, None, None, None, 7],
+        )
+        self.assertEqual(
+            [cfg.is_dsa_indexer_owner_layer(idx) for idx in range(8)],
+            [False, False, False, True, False, False, False, True],
+        )
+        self.assertEqual(
+            [cfg.is_moe_layer(idx) for idx in range(8)],
+            [False, False, False, True, True, True, True, True],
+        )
+        self.assertTrue(cfg.need_fp32_gate)
+        self.assertEqual(cfg.expert_quant_method, "fp8")
+        self.assertEqual(cfg.max_position_embeddings, 1_048_576)
+
+    def test_glm5_next_official_45_layer_schedule(self) -> None:
+        cfg = ModelConfig.from_model_path(
+            _write_config(self, _glm5_next_config(num_layers=45))
+        )
+        self.assertEqual(cfg.num_hidden_layers, 45)
+        self.assertEqual(cfg.num_full_attention_layers, 11)
+        self.assertEqual(
+            cfg.linear_full_attention_layers,
+            list(range(3, 45, 4)),
+        )
+        self.assertEqual(cfg.linear_kda_layers[-1], 44)
+        self.assertEqual(cfg.dsa_indexer_owner_layer(43), 43)
+        self.assertIsNone(cfg.dsa_indexer_owner_layer(44))
+
+    def test_glm5_next_rejects_divergent_architecture_metadata(self) -> None:
+        raw = _glm5_next_config()
+        raw["text_config"]["linear_attn_config"]["kda_layers"].remove(6)
+        with self.assertRaisesRegex(ValueError, r"kda_layers does not match"):
+            ModelConfig.from_model_path(_write_config(self, raw))
+
+        raw = _glm5_next_config()
+        raw["text_config"]["qk_rope_head_dim"] = 64
+        with self.assertRaisesRegex(ValueError, r"requires rope-free MLA"):
+            ModelConfig.from_model_path(_write_config(self, raw))
+
+        raw = _glm5_next_config()
+        raw["text_config"]["index_kpool_always_select_tail"] = False
+        with self.assertRaisesRegex(ValueError, r"always_select_tail=true"):
+            ModelConfig.from_model_path(_write_config(self, raw))
+
+        raw = _glm5_next_config()
+        raw["text_config"]["mhc"] = False
+        with self.assertRaisesRegex(ValueError, r"requires mHC"):
+            ModelConfig.from_model_path(_write_config(self, raw))
+
+    def test_glm5_next_kda_loader_preserves_native_tensor_contract(self) -> None:
+        cfg = ModelConfig.from_model_path(
+            _write_config(self, _tiny_glm5_next_config())
+        )
+        prefix = f"{cfg.layer_tensor_prefix(0)}.self_attn"
+        shape_by_suffix = {
+            "q_proj.weight": (8, 8),
+            "k_proj.weight": (8, 8),
+            "v_proj.weight": (8, 8),
+            "q_conv1d.weight": (8, 1, 4),
+            "k_conv1d.weight": (8, 1, 4),
+            "v_conv1d.weight": (8, 1, 4),
+            "f_a_proj.weight": (4, 8),
+            "f_b_proj.weight": (8, 4),
+            "b_proj.weight": (2, 8),
+            "g_a_proj.weight": (4, 8),
+            "g_b_proj.weight": (8, 4),
+            "o_norm.weight": (4,),
+            "o_proj.weight": (8, 8),
+            "A_log": (2,),
+            "dt_bias": (8,),
+        }
+        tensors = {}
+        torch.manual_seed(7)
+        for suffix, shape in shape_by_suffix.items():
+            dtype = torch.float32 if suffix in ("A_log", "dt_bias") else torch.bfloat16
+            tensors[f"{prefix}.{suffix}"] = (
+                torch.randn(shape, dtype=torch.float32) * 0.05
+            ).to(dtype)
+
+        loader = WeightLoader.__new__(WeightLoader)
+        loader.cfg = cfg
+        loader._weight_map = {name: "fixture" for name in tensors}
+        loader._load_bf16 = lambda name, _device: tensors[name].to(torch.bfloat16)
+        loader._load_f32 = lambda name, _device: tensors[name].float()
+
+        loaded = loader.load_linear_attention_weights(0, torch.device("cpu"))
+        self.assertEqual(
+            set(loaded),
+            {
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "q_conv1d",
+                "k_conv1d",
+                "v_conv1d",
+                "f_a_proj",
+                "f_b_proj",
+                "b_proj",
+                "g_a_proj",
+                "g_b_proj",
+                "o_norm",
+                "o_proj",
+                "A_log",
+                "dt_bias",
+            },
+        )
+        self.assertEqual(loaded["A_log"].dtype, torch.float32)
+        self.assertEqual(loaded["dt_bias"].dtype, torch.float32)
+        self.assertEqual(loaded["q_proj"].dtype, torch.bfloat16)
+
+        full = KimiDeltaAttention(cfg, 0, loaded, torch.device("cpu"))
+        split = KimiDeltaAttention(cfg, 0, loaded, torch.device("cpu"))
+        hidden = (torch.randn(3, cfg.hidden_size) * 0.1).to(torch.bfloat16)
+        full_output = full.forward(hidden, is_decode=False)
+        split_output = torch.cat(
+            [
+                split.forward(hidden[:2], is_decode=False),
+                split.forward(hidden[2:], is_decode=True),
+            ],
+            dim=0,
+        )
+        torch.testing.assert_close(
+            split_output.float(),
+            full_output.float(),
+            rtol=2e-3,
+            atol=2e-3,
+        )
+
+    def test_glm5_next_kpool_and_mhc_tensor_contracts(self) -> None:
+        cfg = ModelConfig.from_model_path(
+            _write_config(self, _tiny_glm5_next_config())
+        )
+        layer_idx = 3
+        prefix = f"{cfg.layer_tensor_prefix(layer_idx)}.self_attn.indexer"
+        index_tensors = {
+            f"{prefix}.wq_b.weight": torch.zeros((8, 4), dtype=torch.bfloat16),
+            f"{prefix}.wk.weight": torch.zeros((4, 8), dtype=torch.bfloat16),
+            f"{prefix}.weights_proj.weight": torch.zeros((2, 8), dtype=torch.bfloat16),
+            f"{prefix}.k_norm.weight": torch.ones((4,), dtype=torch.bfloat16),
+            f"{prefix}.k_norm.bias": torch.zeros((4,), dtype=torch.bfloat16),
+            f"{prefix}.index_kpool_compress_ape": torch.zeros((2, 4), dtype=torch.bfloat16),
+            f"{prefix}.index_kpool_compress_gate": torch.zeros((4, 8), dtype=torch.bfloat16),
+        }
+        loader = WeightLoader.__new__(WeightLoader)
+        loader.cfg = cfg
+        loader._weight_map = {name: "fixture" for name in index_tensors}
+        loader._load_bf16 = lambda name, _device: index_tensors[name]
+        loaded_indexer = loader._load_dsa_indexer_weights(
+            layer_idx, torch.device("cpu")
+        )
+        self.assertEqual(len(loaded_indexer), 7)
+        native_indexer = NativeDsaIndexerWeights(
+            cfg, layer_idx, loaded_indexer
+        )
+        self.assertEqual(
+            tuple(native_indexer.index_kpool_compress_ape.shape), (2, 4)
+        )
+
+        mix_width = (2 + cfg.hc_mult) * cfg.hc_mult
+        hc_input = cfg.hc_mult * cfg.hidden_size
+        hc_tensors = {
+            "hc_attn_fn": torch.zeros((mix_width, hc_input)),
+            "hc_attn_base": torch.zeros((mix_width,)),
+            "hc_attn_scale": torch.ones((3,)),
+            "hc_ffn_fn": torch.zeros((mix_width, hc_input)),
+            "hc_ffn_base": torch.zeros((mix_width,)),
+            "hc_ffn_scale": torch.ones((3,)),
+        }
+        native_hc = NativeHyperConnectionWeights(cfg, layer_idx, hc_tensors)
+        self.assertIs(native_hc.tensors, hc_tensors)
 
     def test_non_dsa_defaults_remain_disabled(self) -> None:
         raw = _glm_dsa_config()
