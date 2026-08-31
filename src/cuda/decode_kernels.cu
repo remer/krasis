@@ -10,6 +10,7 @@
 #include "deepseek_v4_hc.cuh"
 #include "deepseek_v4_attention.cuh"
 #include "deepseek_v4_compressor.cuh"
+#include "glm5_next_kda.cuh"
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -3181,9 +3182,10 @@ __device__ __forceinline__ void mla_sparse_attention_k4_body(
         int pos = selected_indices[slot];
         float score = -1e30f;
         if (pos >= 0 && pos < seq_len) {
-            score =
-                mla_dot_k4(ckv_cache, pos, kv_lora_rank, s_q_abs) +
-                mla_dot_k4(kpe_cache, pos, qk_rope_dim, s_q_pe);
+            score = mla_dot_k4(ckv_cache, pos, kv_lora_rank, s_q_abs);
+            if (qk_rope_dim > 0) {
+                score += mla_dot_k4(kpe_cache, pos, qk_rope_dim, s_q_pe);
+            }
             score *= sm_scale;
         }
         local_max = fmaxf(local_max, score);
@@ -3213,9 +3215,12 @@ __device__ __forceinline__ void mla_sparse_attention_k4_body(
             int pos = selected_indices[tile_start + ti];
             float weight = 0.0f;
             if (pos >= 0 && pos < seq_len) {
-                float score =
-                    mla_dot_k4(ckv_cache, pos, kv_lora_rank, s_q_abs) +
-                    mla_dot_k4(kpe_cache, pos, qk_rope_dim, s_q_pe);
+                float score = mla_dot_k4(
+                    ckv_cache, pos, kv_lora_rank, s_q_abs);
+                if (qk_rope_dim > 0) {
+                    score += mla_dot_k4(
+                        kpe_cache, pos, qk_rope_dim, s_q_pe);
+                }
                 weight = __expf(score * sm_scale - global_max);
             }
             smem_weights[ti] = weight;

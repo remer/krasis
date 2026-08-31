@@ -940,6 +940,42 @@ class ModelConfigContractTests(unittest.TestCase):
         native_hc = NativeHyperConnectionWeights(cfg, layer_idx, hc_tensors)
         self.assertIs(native_hc.tensors, hc_tensors)
 
+    def test_glm5_next_promotes_mixed_checkpoint_control_weights(self) -> None:
+        cfg = ModelConfig.from_model_path(
+            _write_config(self, _tiny_glm5_next_config())
+        )
+        layer_idx = 3
+        prefix = cfg.layer_tensor_prefix(layer_idx)
+        tensors = {
+            f"{prefix}.hc_attn_fn": torch.zeros((24, 32), dtype=torch.bfloat16),
+            f"{prefix}.hc_attn_base": torch.zeros((24,), dtype=torch.float32),
+            f"{prefix}.hc_attn_scale": torch.ones((3,), dtype=torch.float32),
+            f"{prefix}.hc_ffn_fn": torch.zeros((24, 32), dtype=torch.bfloat16),
+            f"{prefix}.hc_ffn_base": torch.zeros((24,), dtype=torch.float32),
+            f"{prefix}.hc_ffn_scale": torch.ones((3,), dtype=torch.float32),
+            f"{prefix}.mlp.gate.weight": torch.zeros((4, 8), dtype=torch.bfloat16),
+            f"{prefix}.mlp.gate.e_score_correction_bias": torch.zeros(
+                (4,), dtype=torch.float32
+            ),
+        }
+        loader = WeightLoader.__new__(WeightLoader)
+        loader.cfg = cfg
+        loader._weight_map = {name: "fixture" for name in tensors}
+        loader._read_tensor = tensors.__getitem__
+
+        hyper_connection = loader.load_hyper_connection(
+            layer_idx, torch.device("cpu")
+        )
+        self.assertTrue(
+            all(tensor.dtype == torch.float32 for tensor in hyper_connection.values())
+        )
+
+        router = loader.load_moe_gate(layer_idx, torch.device("cpu"))
+        self.assertEqual(router["weight"].dtype, torch.float32)
+        self.assertEqual(
+            router["e_score_correction_bias"].dtype, torch.float32
+        )
+
     def test_non_dsa_defaults_remain_disabled(self) -> None:
         raw = _glm_dsa_config()
         raw["model_type"] = "deepseek_v3"

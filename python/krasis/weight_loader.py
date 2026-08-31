@@ -569,6 +569,31 @@ class WeightLoader:
     ) -> Dict[str, torch.Tensor]:
         """Load the shared mHC tensor contract used by DeepSeek-V4 and GLM-5.3."""
         prefix = self.cfg.layer_tensor_prefix(layer_idx)
+        if self.cfg.is_glm5_next:
+            # The released GLM-5.3 checkpoint stores the two large projection
+            # matrices as BF16, while its reference forward explicitly calls
+            # ``fn.float()``.  Base/scale are natively FP32.  Materialize that
+            # mixed checkpoint contract as the all-FP32 CUDA mHC contract.
+            return {
+                "hc_attn_fn": self._load_bf16(
+                    f"{prefix}.hc_attn_fn", device
+                ).float(),
+                "hc_attn_base": self._load_f32(
+                    f"{prefix}.hc_attn_base", device
+                ),
+                "hc_attn_scale": self._load_f32(
+                    f"{prefix}.hc_attn_scale", device
+                ),
+                "hc_ffn_fn": self._load_bf16(
+                    f"{prefix}.hc_ffn_fn", device
+                ).float(),
+                "hc_ffn_base": self._load_f32(
+                    f"{prefix}.hc_ffn_base", device
+                ),
+                "hc_ffn_scale": self._load_f32(
+                    f"{prefix}.hc_ffn_scale", device
+                ),
+            }
         return {
             name: self._load_f32(f"{prefix}.{name}", device)
             for name in (
@@ -1056,7 +1081,14 @@ class WeightLoader:
         else:
             prefix = prefix_router
             weight_name = f"{prefix}.weight"
-        gate_loader = self._load_f32 if self.cfg.need_fp32_gate else self._load_bf16
+        if self.cfg.is_glm5_next and self.cfg.need_fp32_gate:
+            # GLM-5.3 stores the router matrix as BF16, then the reference
+            # forward promotes both activations and weights to FP32 for the
+            # routing calculation.  Preserve that semantic contract without
+            # requiring a nonexistent FP32 checkpoint tensor.
+            gate_loader = lambda name, target: self._load_bf16(name, target).float()
+        else:
+            gate_loader = self._load_f32 if self.cfg.need_fp32_gate else self._load_bf16
         result = {
             "weight": gate_loader(weight_name, device),
         }

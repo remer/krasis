@@ -3425,6 +3425,11 @@ const KERNEL_NAMES: &[&str] = &[
     "deepseek_v4_hc_reduce_tiled_kernel",
     "deepseek_v4_hc_post_tiled_kernel",
     "deepseek_v4_hc_head_prepare_kernel",
+    "glm5_next_kda_conv_decode_kernel",
+    "glm5_next_kda_recurrent_decode_kernel",
+    "glm5_next_hc_mean_kernel",
+    "glm5_next_kpool_update_kernel",
+    "glm5_next_kpool_expand_indices_kernel",
     "deepseek_v4_rmsnorm_rows_bf16_kernel",
     "deepseek_v4_tail_rope_bf16_kernel",
     "deepseek_v4_sparse_scores_kernel",
@@ -7715,6 +7720,7 @@ struct GpuDecodeLayer {
     hqq_prefill_sidecars: Vec<HqqPrefillSidecarRegistration>,
     dsa_indexer: Option<DsaIndexerRegistration>,
     deepseek_v4: Option<DeepseekV4LayerRegistration>,
+    glm5_next_hyper_connection: Option<DeepseekV4HyperConnectionRegistration>,
     mlp: GpuMlpConfig,
 }
 
@@ -7731,6 +7737,38 @@ struct DsaIndexerRegistration {
     q_lora_rank: usize,
     hidden_size: usize,
     rope_interleave: bool,
+    glm5_next_kpool: Option<Glm5NextKpoolRegistration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Glm5NextKpoolRegistration {
+    pool_size: usize,
+    always_select_tail: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Glm5NextKdaRegistration {
+    q_proj: usize,
+    k_proj: usize,
+    v_proj: usize,
+    f_a_proj: usize,
+    f_b_proj: usize,
+    b_proj: usize,
+    g_a_proj: usize,
+    g_b_proj: usize,
+    o_proj: usize,
+    conv_weight_ptr: u64,
+    a_log_ptr: u64,
+    dt_bias_ptr: u64,
+    o_norm_ptr: u64,
+    conv_state_ptr: u64,
+    recur_state_ptr: u64,
+    num_heads: usize,
+    head_dim: usize,
+    kernel_dim: usize,
+    query_scale: f32,
+    gate_lower_bound: f32,
+    norm_eps: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -7926,6 +7964,25 @@ struct DsaIndexerOwnerResource {
     topk_capacity: usize,
     d_key_cache: cudarc::driver::CudaSlice<u16>,
     d_topk_indices: cudarc::driver::CudaSlice<i32>,
+    glm5_next_kpool: Option<Glm5NextKpoolResource>,
+}
+
+struct Glm5NextKpoolResource {
+    ape_wid: usize,
+    gate_wid: usize,
+    pool_capacity: usize,
+    d_key_tail: cudarc::driver::CudaSlice<u16>,
+    d_gate_tail: cudarc::driver::CudaSlice<u16>,
+    d_pool_topk_indices: cudarc::driver::CudaSlice<i32>,
+}
+
+impl DsaIndexerOwnerResource {
+    fn score_capacity(&self) -> usize {
+        self.glm5_next_kpool
+            .as_ref()
+            .map(|resource| resource.pool_capacity)
+            .unwrap_or(self.max_context_tokens)
+    }
 }
 
 struct DsaIndexShareReplicaResource {
@@ -8009,6 +8066,67 @@ struct DeepseekV4DecodeWorkspace {
     d_topk_scores_b: Option<cudarc::driver::CudaSlice<f32>>,
     d_topk_indices_a: Option<cudarc::driver::CudaSlice<i32>>,
     d_topk_indices_b: Option<cudarc::driver::CudaSlice<i32>>,
+}
+
+/// GLM-5.3 uses the same mHC equations as DeepSeek-V4 but a different
+/// attention graph and an unweighted-mean final head. Keep its workspace
+/// separate so selecting GLM can never route through the V4 attention path.
+struct Glm5NextDecodeWorkspace {
+    hc_mult: usize,
+    max_hc_mix_width: usize,
+    swiglu_limit: f32,
+    d_hc_state: cudarc::driver::CudaSlice<u16>,
+    d_hc_next: cudarc::driver::CudaSlice<u16>,
+    d_hc_inv_rms: cudarc::driver::CudaSlice<f32>,
+    d_hc_mixes: cudarc::driver::CudaSlice<f32>,
+    d_hc_pre: cudarc::driver::CudaSlice<f32>,
+    d_hc_post: cudarc::driver::CudaSlice<f32>,
+    d_hc_comb: cudarc::driver::CudaSlice<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HyperConnectionDecodeWorkspaceView {
+    hc_mult: usize,
+    max_hc_mix_width: usize,
+    state_ptr: u64,
+    next_ptr: u64,
+    inv_rms_ptr: u64,
+    mixes_ptr: u64,
+    pre_ptr: u64,
+    post_ptr: u64,
+    comb_ptr: u64,
+}
+
+fn hyper_connection_decode_workspace_view(
+    graph: &GpuDecodeGraph,
+) -> Result<HyperConnectionDecodeWorkspaceView, String> {
+    if let Some(workspace) = graph.glm5_next_decode_workspace.as_ref() {
+        return Ok(HyperConnectionDecodeWorkspaceView {
+            hc_mult: workspace.hc_mult,
+            max_hc_mix_width: workspace.max_hc_mix_width,
+            state_ptr: *workspace.d_hc_state.device_ptr(),
+            next_ptr: *workspace.d_hc_next.device_ptr(),
+            inv_rms_ptr: *workspace.d_hc_inv_rms.device_ptr(),
+            mixes_ptr: *workspace.d_hc_mixes.device_ptr(),
+            pre_ptr: *workspace.d_hc_pre.device_ptr(),
+            post_ptr: *workspace.d_hc_post.device_ptr(),
+            comb_ptr: *workspace.d_hc_comb.device_ptr(),
+        });
+    }
+    if let Some(workspace) = graph.deepseek_v4_decode_workspace.as_ref() {
+        return Ok(HyperConnectionDecodeWorkspaceView {
+            hc_mult: workspace.hc_mult,
+            max_hc_mix_width: workspace.max_hc_mix_width,
+            state_ptr: *workspace.d_hc_state.device_ptr(),
+            next_ptr: *workspace.d_hc_next.device_ptr(),
+            inv_rms_ptr: *workspace.d_hc_inv_rms.device_ptr(),
+            mixes_ptr: *workspace.d_hc_mixes.device_ptr(),
+            pre_ptr: *workspace.d_hc_pre.device_ptr(),
+            post_ptr: *workspace.d_hc_post.device_ptr(),
+            comb_ptr: *workspace.d_hc_comb.device_ptr(),
+        });
+    }
+    Err("multi-stream hyper-connection workspace is not finalized".to_string())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8229,7 +8347,6 @@ fn validate_dsa_indexer_registration(
         ("index_topk", index_topk),
         ("index_head_dim", index_head_dim),
         ("index_n_heads", index_n_heads),
-        ("qk_rope_head_dim", qk_rope_head_dim),
         ("index_topk_freq", index_topk_freq),
         ("q_lora_rank", q_lora_rank),
         ("hidden_size", hidden_size),
@@ -8287,6 +8404,7 @@ fn validate_dsa_indexer_registration(
         q_lora_rank,
         hidden_size,
         rope_interleave,
+        glm5_next_kpool: None,
     })
 }
 
@@ -12180,6 +12298,7 @@ pub(crate) mod dsa_registration_tests {
                 topk_capacity: 4,
                 d_key_cache: source_key_cache,
                 d_topk_indices: source_indices,
+                glm5_next_kpool: None,
             });
             graph.dsa_indexer_resources_finalized = true;
         }
@@ -12234,6 +12353,7 @@ pub(crate) mod dsa_registration_tests {
                 topk_capacity: 4,
                 d_key_cache: destination_key_cache,
                 d_topk_indices: destination_indices,
+                glm5_next_kpool: None,
             });
             graph.dsa_indexer_resources_finalized = true;
         }
@@ -12453,6 +12573,8 @@ pub(crate) mod dsa_registration_tests {
                 k_norm_weight_wid,
                 k_norm_bias_wid,
                 max_context_tokens,
+                None,
+                None,
             )
             .expect("owner resource");
         store
@@ -12786,6 +12908,8 @@ pub(crate) mod dsa_registration_tests {
                 k_norm_weight_wid,
                 k_norm_bias_wid,
                 selector_max_context,
+                None,
+                None,
             )
             .expect("owner resource");
         store
@@ -13579,6 +13703,7 @@ impl GpuDecodeLayer {
             hqq_prefill_sidecars: Vec::new(),
             dsa_indexer: None,
             deepseek_v4: None,
+            glm5_next_hyper_connection: None,
             mlp: GpuMlpConfig::None,
         }
     }
@@ -14774,6 +14899,7 @@ fn register_hqq_attention_layer_common(
             scale: *scale,
             conv_state_ptr: *conv_state_ptr,
             recur_state_ptr: *recur_state_ptr,
+            kda: None,
         },
         (
             _,
@@ -14889,6 +15015,7 @@ fn register_hqq_attention_layer_common(
             scale: *scale,
             conv_state_ptr: *conv_state_ptr,
             recur_state_ptr: *recur_state_ptr,
+            kda: None,
         },
     };
     graph.layers[layer_idx].hqq = Some(HqqLayerRegistration {
@@ -14937,6 +15064,11 @@ enum GpuAttnConfig {
         scale: f32,
         conv_state_ptr: u64,  // [conv_dim, kernel_dim] FP32 on GPU
         recur_state_ptr: u64, // [nv, dk, dv] FP32 on GPU
+        /// GLM-5.3 uses Kimi Delta Attention rather than Qwen's Gated
+        /// DeltaNet. Keeping the registration nested under the existing LA
+        /// route preserves scheduling/accounting while making execution
+        /// semantics explicit and fail-closed.
+        kda: Option<Glm5NextKdaRegistration>,
     },
     GQA {
         q_proj: usize,
@@ -15503,6 +15635,11 @@ struct CachedKernels {
     deepseek_v4_hc_reduce_tiled: cudarc::driver::CudaFunction,
     deepseek_v4_hc_post_tiled: cudarc::driver::CudaFunction,
     deepseek_v4_hc_head_prepare: cudarc::driver::CudaFunction,
+    glm5_next_kda_conv_decode: cudarc::driver::CudaFunction,
+    glm5_next_kda_recurrent_decode: cudarc::driver::CudaFunction,
+    glm5_next_hc_mean: cudarc::driver::CudaFunction,
+    glm5_next_kpool_update: cudarc::driver::CudaFunction,
+    glm5_next_kpool_expand_indices: cudarc::driver::CudaFunction,
     deepseek_v4_rmsnorm_rows_bf16: cudarc::driver::CudaFunction,
     deepseek_v4_tail_rope_bf16: cudarc::driver::CudaFunction,
     deepseek_v4_sparse_scores: cudarc::driver::CudaFunction,
@@ -15696,6 +15833,7 @@ struct GpuDecodeGraph {
     dsa_indexer_workspace: Option<DsaIndexerWorkspace>,
     dsa_indexer_resources_finalized: bool,
     deepseek_v4_decode_workspace: Option<DeepseekV4DecodeWorkspace>,
+    glm5_next_decode_workspace: Option<Glm5NextDecodeWorkspace>,
     vocab_size: usize,
     eps: f32,
     intermediate_size: usize,     // max intermediate (for buffer allocation)
@@ -26032,10 +26170,15 @@ impl GpuDecodeStore {
                 GpuAttnConfig::MLA {
                     ckv_cache_ptr,
                     kpe_cache_ptr,
+                    qk_rope_dim,
                     ..
                 } => {
                     required.push((format!("layer{}.mla.compressed", layer_idx), *ckv_cache_ptr));
-                    required.push((format!("layer{}.mla.position", layer_idx), *kpe_cache_ptr));
+                    // NoPE MLA has no positional component and therefore no
+                    // backing allocation to include in sequence snapshots.
+                    if *qk_rope_dim > 0 {
+                        required.push((format!("layer{}.mla.position", layer_idx), *kpe_cache_ptr));
+                    }
                 }
                 GpuAttnConfig::Mamba2 {
                     conv_state_ptr,
@@ -26266,8 +26409,11 @@ impl GpuDecodeStore {
                     max_context_tokens
                 );
                 // Cache scratch VRAM computation for eviction checks (survives take_prefill_engine)
-                self.prefill_scratch_info =
-                    Some(crate::gpu_prefill::compute_scratch_vram(&engine.config));
+                self.prefill_scratch_info = if engine.glm5_next_sequential_decode_prefill {
+                    Some((0, 0))
+                } else {
+                    Some(crate::gpu_prefill::compute_scratch_vram(&engine.config))
+                };
                 self.prefill_engine_slot = Some(engine);
                 if self.has_hqq_runtime_slots() {
                     self.prepare_runtime_for_decode_rust()
@@ -26291,6 +26437,9 @@ impl GpuDecodeStore {
         let engine = self.prefill_engine_slot.as_ref().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("Prefill engine not allocated yet")
         })?;
+        if engine.glm5_next_sequential_decode_prefill {
+            return Ok(0);
+        }
         let (fixed_bytes, per_token_bytes) =
             crate::gpu_prefill::compute_scratch_vram(&engine.config);
         let total_bytes = fixed_bytes + per_token_bytes * max_tokens;
@@ -26358,6 +26507,24 @@ impl GpuDecodeStore {
         let vram_calibration = self.vram_calibration;
         self.refresh_trace_config();
         let trace_cfg = self.active_trace_owned();
+        if self.is_glm5_next_runtime() {
+            let (encoded_len, prefill_time_ms) = self
+                .glm5_next_sequential_encode_rust(&token_ids, 0, true)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            let first_token = self
+                .glm5_next_sample_current_logits_rust(temperature, &[])
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            self.last_rust_prefill_measurement = Some((encoded_len, prefill_time_ms, 0));
+            trace_emit_global_mark(
+                trace_cfg.as_ref(),
+                "prefill",
+                &format!(
+                    "phase=glm5_next_sequential_decode prompt_tokens={} prefill_ms={:.1}",
+                    encoded_len, prefill_time_ms,
+                ),
+            );
+            return Ok((first_token, encoded_len, false));
+        }
         let dspark_target_capture = self.dspark.as_ref().and_then(|runtime| {
             let buffers = runtime.buffers.as_ref()?;
             let graph = self.graph.as_ref()?;
@@ -26907,6 +27074,7 @@ impl GpuDecodeStore {
             dsa_indexer_workspace: None,
             dsa_indexer_resources_finalized: false,
             deepseek_v4_decode_workspace: None,
+            glm5_next_decode_workspace: None,
             vocab_size,
             eps,
             intermediate_size: intermediate,
@@ -27521,6 +27689,11 @@ impl GpuDecodeStore {
                 deepseek_v4_hc_reduce_tiled: get("deepseek_v4_hc_reduce_tiled_kernel")?,
                 deepseek_v4_hc_post_tiled: get("deepseek_v4_hc_post_tiled_kernel")?,
                 deepseek_v4_hc_head_prepare: get("deepseek_v4_hc_head_prepare_kernel")?,
+                glm5_next_kda_conv_decode: get("glm5_next_kda_conv_decode_kernel")?,
+                glm5_next_kda_recurrent_decode: get("glm5_next_kda_recurrent_decode_kernel")?,
+                glm5_next_hc_mean: get("glm5_next_hc_mean_kernel")?,
+                glm5_next_kpool_update: get("glm5_next_kpool_update_kernel")?,
+                glm5_next_kpool_expand_indices: get("glm5_next_kpool_expand_indices_kernel")?,
                 deepseek_v4_rmsnorm_rows_bf16: get("deepseek_v4_rmsnorm_rows_bf16_kernel")?,
                 deepseek_v4_tail_rope_bf16: get("deepseek_v4_tail_rope_bf16_kernel")?,
                 deepseek_v4_sparse_scores: get("deepseek_v4_sparse_scores_kernel")?,
@@ -32342,6 +32515,7 @@ impl GpuDecodeStore {
             scale,
             conv_state_ptr: conv_state_ptr as u64,
             recur_state_ptr: recur_state_ptr as u64,
+            kda: None,
         };
         log::info!(
             "GpuDecodeStore: registered LA layer {} (conv_dim={}, nk={}, nv={}), total_layers={}",
@@ -32350,6 +32524,195 @@ impl GpuDecodeStore {
             nk,
             nv,
             graph.layers.len()
+        );
+        Ok(())
+    }
+
+    /// Register one GLM-5.3 Kimi Delta Attention layer. The tensor geometry is
+    /// validated here so a legacy Gated-DeltaNet path can never be selected
+    /// accidentally for a superficially similar hybrid layer.
+    #[pyo3(signature = (
+        layer_idx, input_norm_ptr, input_norm_size,
+        post_attn_norm_ptr, post_attn_norm_size,
+        q_proj_wid, k_proj_wid, v_proj_wid, f_a_proj_wid, f_b_proj_wid,
+        b_proj_wid, g_a_proj_wid, g_b_proj_wid, o_proj_wid,
+        conv_weight_ptr, conv_weight_elems, a_log_ptr, a_log_elems,
+        dt_bias_ptr, dt_bias_elems, o_norm_ptr, o_norm_elems,
+        conv_state_ptr, conv_state_elems, recur_state_ptr, recur_state_elems,
+        num_heads, head_dim, kernel_dim, query_scale, gate_lower_bound, norm_eps
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_glm5_next_kda_layer(
+        &mut self,
+        layer_idx: usize,
+        input_norm_ptr: usize,
+        input_norm_size: usize,
+        post_attn_norm_ptr: usize,
+        post_attn_norm_size: usize,
+        q_proj_wid: usize,
+        k_proj_wid: usize,
+        v_proj_wid: usize,
+        f_a_proj_wid: usize,
+        f_b_proj_wid: usize,
+        b_proj_wid: usize,
+        g_a_proj_wid: usize,
+        g_b_proj_wid: usize,
+        o_proj_wid: usize,
+        conv_weight_ptr: usize,
+        conv_weight_elems: usize,
+        a_log_ptr: usize,
+        a_log_elems: usize,
+        dt_bias_ptr: usize,
+        dt_bias_elems: usize,
+        o_norm_ptr: usize,
+        o_norm_elems: usize,
+        conv_state_ptr: usize,
+        conv_state_elems: usize,
+        recur_state_ptr: usize,
+        recur_state_elems: usize,
+        num_heads: usize,
+        head_dim: usize,
+        kernel_dim: usize,
+        query_scale: f32,
+        gate_lower_bound: f32,
+        norm_eps: f32,
+    ) -> PyResult<()> {
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let hidden_size = graph.hidden_size;
+        let width = num_heads.checked_mul(head_dim).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err("GLM-5.3 KDA head width overflow")
+        })?;
+        let conv_dim = width.checked_mul(3).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err("GLM-5.3 KDA convolution width overflow")
+        })?;
+        let expected_conv = conv_dim.checked_mul(kernel_dim).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err("GLM-5.3 KDA convolution state overflow")
+        })?;
+        let expected_recur = num_heads
+            .checked_mul(head_dim)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyOverflowError::new_err("GLM-5.3 KDA recurrent state overflow")
+            })?;
+        if num_heads == 0
+            || head_dim == 0
+            || head_dim > 1024
+            || !head_dim.is_power_of_two()
+            || kernel_dim == 0
+            || input_norm_ptr == 0
+            || input_norm_size != hidden_size
+            || post_attn_norm_ptr == 0
+            || post_attn_norm_size != hidden_size
+            || conv_weight_ptr == 0
+            || conv_weight_elems != expected_conv
+            || a_log_ptr == 0
+            || a_log_elems != num_heads
+            || dt_bias_ptr == 0
+            || dt_bias_elems != width
+            || o_norm_ptr == 0
+            || o_norm_elems != head_dim
+            || conv_state_ptr == 0
+            || conv_state_elems != expected_conv
+            || recur_state_ptr == 0
+            || recur_state_elems != expected_recur
+            || !query_scale.is_finite()
+            || query_scale <= 0.0
+            || !gate_lower_bound.is_finite()
+            || gate_lower_bound >= 0.0
+            || !norm_eps.is_finite()
+            || norm_eps <= 0.0
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "GLM-5.3 KDA layer {} has an invalid geometry/state contract",
+                layer_idx
+            )));
+        }
+        let expected = [
+            ("q_proj", q_proj_wid, width, hidden_size),
+            ("k_proj", k_proj_wid, width, hidden_size),
+            ("v_proj", v_proj_wid, width, hidden_size),
+            ("f_a_proj", f_a_proj_wid, head_dim, hidden_size),
+            ("f_b_proj", f_b_proj_wid, width, head_dim),
+            ("b_proj", b_proj_wid, num_heads, hidden_size),
+            ("g_a_proj", g_a_proj_wid, head_dim, hidden_size),
+            ("g_b_proj", g_b_proj_wid, width, head_dim),
+            ("o_proj", o_proj_wid, hidden_size, width),
+        ];
+        for (name, wid, rows, cols) in expected {
+            let weight = graph.weights.get(wid).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "GLM-5.3 KDA layer {} has invalid {} weight id {}",
+                    layer_idx, name, wid
+                ))
+            })?;
+            if weight.dtype != 0 || (weight.rows, weight.cols) != (rows, cols) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "GLM-5.3 KDA layer {} {} must be BF16 [{},{}], got dtype={} [{},{}]",
+                    layer_idx, name, rows, cols, weight.dtype, weight.rows, weight.cols
+                )));
+            }
+        }
+        while graph.layers.len() <= layer_idx {
+            graph.layers.push(GpuDecodeLayer::placeholder());
+        }
+        let layer = &mut graph.layers[layer_idx];
+        layer.input_norm_ptr = input_norm_ptr as u64;
+        layer.input_norm_size = input_norm_size;
+        layer.post_attn_norm_ptr = post_attn_norm_ptr as u64;
+        layer.post_attn_norm_size = post_attn_norm_size;
+        layer.hqq = None;
+        layer.hqq_exec = None;
+        layer.attn = GpuAttnConfig::LinearAttention {
+            in_proj_qkvz: q_proj_wid,
+            in_proj_ba: f_a_proj_wid,
+            out_proj: o_proj_wid,
+            conv_weight_ptr: conv_weight_ptr as u64,
+            a_log_ptr: a_log_ptr as u64,
+            dt_bias_ptr: dt_bias_ptr as u64,
+            norm_weight_ptr: o_norm_ptr as u64,
+            nk: num_heads,
+            nv: num_heads,
+            dk: head_dim,
+            dv: head_dim,
+            hr: 1,
+            kernel_dim,
+            conv_dim,
+            scale: query_scale,
+            conv_state_ptr: conv_state_ptr as u64,
+            recur_state_ptr: recur_state_ptr as u64,
+            kda: Some(Glm5NextKdaRegistration {
+                q_proj: q_proj_wid,
+                k_proj: k_proj_wid,
+                v_proj: v_proj_wid,
+                f_a_proj: f_a_proj_wid,
+                f_b_proj: f_b_proj_wid,
+                b_proj: b_proj_wid,
+                g_a_proj: g_a_proj_wid,
+                g_b_proj: g_b_proj_wid,
+                o_proj: o_proj_wid,
+                conv_weight_ptr: conv_weight_ptr as u64,
+                a_log_ptr: a_log_ptr as u64,
+                dt_bias_ptr: dt_bias_ptr as u64,
+                o_norm_ptr: o_norm_ptr as u64,
+                conv_state_ptr: conv_state_ptr as u64,
+                recur_state_ptr: recur_state_ptr as u64,
+                num_heads,
+                head_dim,
+                kernel_dim,
+                query_scale,
+                gate_lower_bound,
+                norm_eps,
+            }),
+        };
+        log::info!(
+            "GpuDecodeStore: registered GLM-5.3 KDA layer {} (heads={}, dim={}, conv={})",
+            layer_idx,
+            num_heads,
+            head_dim,
+            kernel_dim,
         );
         Ok(())
     }
@@ -32375,10 +32738,15 @@ impl GpuDecodeStore {
             GpuAttnConfig::LinearAttention {
                 conv_state_ptr,
                 recur_state_ptr,
+                kda,
                 ..
             } => {
                 *conv_state_ptr = new_conv_state_ptr as u64;
                 *recur_state_ptr = new_recur_state_ptr as u64;
+                if let Some(kda) = kda.as_mut() {
+                    kda.conv_state_ptr = new_conv_state_ptr as u64;
+                    kda.recur_state_ptr = new_recur_state_ptr as u64;
+                }
             }
             _ => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -33296,6 +33664,106 @@ impl GpuDecodeStore {
     }
 
     #[pyo3(signature = (
+        layer_idx, attn_fn_wid, attn_base_ptr, attn_base_elems,
+        attn_scale_ptr, attn_scale_elems, ffn_fn_wid, ffn_base_ptr,
+        ffn_base_elems, ffn_scale_ptr, ffn_scale_elems, mult,
+        sinkhorn_iters, eps
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_glm5_next_hyper_connection(
+        &mut self,
+        layer_idx: usize,
+        attn_fn_wid: usize,
+        attn_base_ptr: usize,
+        attn_base_elems: usize,
+        attn_scale_ptr: usize,
+        attn_scale_elems: usize,
+        ffn_fn_wid: usize,
+        ffn_base_ptr: usize,
+        ffn_base_elems: usize,
+        ffn_scale_ptr: usize,
+        ffn_scale_elems: usize,
+        mult: usize,
+        sinkhorn_iters: usize,
+        eps: f32,
+    ) -> PyResult<()> {
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let layer = graph.layers.get(layer_idx).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Register GLM-5.3 attention layer {} before its hyper-connection",
+                layer_idx
+            ))
+        })?;
+        let is_glm_attention = matches!(
+            &layer.attn,
+            GpuAttnConfig::LinearAttention { kda: Some(_), .. }
+                | GpuAttnConfig::MLA { qk_rope_dim: 0, .. }
+        );
+        if !is_glm_attention
+            || layer.glm5_next_hyper_connection.is_some()
+            || mult == 0
+            || sinkhorn_iters == 0
+            || !eps.is_finite()
+            || eps <= 0.0
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "GLM-5.3 layer {} has invalid/duplicate hyper-connection config",
+                layer_idx
+            )));
+        }
+        let mix_width = (2usize + mult).checked_mul(mult).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err("GLM-5.3 HC mix width overflow")
+        })?;
+        let hc_input = mult.checked_mul(graph.hidden_size).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err("GLM-5.3 HC input width overflow")
+        })?;
+        for (wid, name) in [(attn_fn_wid, "attention"), (ffn_fn_wid, "ffn")] {
+            let weight = graph.weights.get(wid).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "GLM-5.3 layer {} has invalid {} HC weight id {}",
+                    layer_idx, name, wid
+                ))
+            })?;
+            if weight.dtype != 1 || (weight.rows, weight.cols) != (mix_width, hc_input) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "GLM-5.3 layer {} {} HC projection must be FP32 [{},{}], got dtype={} [{},{}]",
+                    layer_idx, name, mix_width, hc_input, weight.dtype, weight.rows, weight.cols,
+                )));
+            }
+        }
+        if attn_base_ptr == 0
+            || attn_base_elems != mix_width
+            || attn_scale_ptr == 0
+            || attn_scale_elems != 3
+            || ffn_base_ptr == 0
+            || ffn_base_elems != mix_width
+            || ffn_scale_ptr == 0
+            || ffn_scale_elems != 3
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "GLM-5.3 layer {} HC vector contract mismatch",
+                layer_idx
+            )));
+        }
+        graph.layers[layer_idx].glm5_next_hyper_connection =
+            Some(DeepseekV4HyperConnectionRegistration {
+                attn_fn_wid,
+                attn_base_ptr: attn_base_ptr as u64,
+                attn_scale_ptr: attn_scale_ptr as u64,
+                ffn_fn_wid,
+                ffn_base_ptr: ffn_base_ptr as u64,
+                ffn_scale_ptr: ffn_scale_ptr as u64,
+                mult,
+                sinkhorn_iters,
+                eps,
+            });
+        Ok(())
+    }
+
+    #[pyo3(signature = (
         fn_wid, base_ptr, base_elems, scale_ptr, scale_elems, mult, eps
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -33712,6 +34180,172 @@ impl GpuDecodeStore {
         Ok(plan.layer_count)
     }
 
+    /// Finalize the GLM-5.3 multi-stream decode graph after every KDA/MLA layer
+    /// and its mHC weights have been registered.
+    fn finalize_glm5_next_layers(
+        &mut self,
+        logical_max_seq: usize,
+        swiglu_limit: f32,
+    ) -> PyResult<usize> {
+        let (layer_count, hc_mult, max_hc_mix_width, hidden_size) = {
+            let graph = self
+                .graph
+                .as_ref()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+            if graph.glm5_next_decode_workspace.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "GLM-5.3 decode resources are already finalized",
+                ));
+            }
+            if graph.deepseek_v4_decode_workspace.is_some() || graph.deepseek_v4_head.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "GLM-5.3 and DeepSeek-V4 multi-stream graphs cannot coexist",
+                ));
+            }
+            if logical_max_seq == 0
+                || !swiglu_limit.is_finite()
+                || swiglu_limit <= 0.0
+                || graph.layers.len() < graph.num_layers
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "GLM-5.3 finalization requires {} registered layers, positive capacity, and a positive finite SwiGLU limit; got {} layers, capacity {}, limit {}",
+                    graph.num_layers,
+                    graph.layers.len(),
+                    logical_max_seq,
+                    swiglu_limit,
+                )));
+            }
+            let mut hc_mult = 0usize;
+            let mut max_hc_mix_width = 0usize;
+            let mut kda_layers = 0usize;
+            let mut sparse_layers = 0usize;
+            for layer_idx in 0..graph.num_layers {
+                let layer = &graph.layers[layer_idx];
+                match &layer.attn {
+                    GpuAttnConfig::LinearAttention { kda: Some(_), .. } => {
+                        kda_layers += 1;
+                    }
+                    GpuAttnConfig::MLA {
+                        qk_rope_dim,
+                        q_lora_rank,
+                        ..
+                    } if *qk_rope_dim == 0 && *q_lora_rank > 0 => {
+                        sparse_layers += 1;
+                        if layer.dsa_indexer.is_none() {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "GLM-5.3 sparse layer {} has no DSA registration",
+                                layer_idx
+                            )));
+                        }
+                        if layer
+                            .dsa_indexer
+                            .as_ref()
+                            .and_then(|registration| registration.glm5_next_kpool)
+                            .is_none()
+                        {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "GLM-5.3 sparse layer {} has no learned k-pool registration",
+                                layer_idx
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "GLM-5.3 layer {} is neither registered KDA nor NoPE sparse MLA",
+                            layer_idx
+                        )));
+                    }
+                }
+                let hc = layer.glm5_next_hyper_connection.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "GLM-5.3 layer {} has no hyper-connection registration",
+                        layer_idx
+                    ))
+                })?;
+                if hc_mult == 0 {
+                    hc_mult = hc.mult;
+                } else if hc.mult != hc_mult {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "GLM-5.3 layer {} HC multiplier {} differs from {}",
+                        layer_idx, hc.mult, hc_mult
+                    )));
+                }
+                max_hc_mix_width = max_hc_mix_width.max((2 + hc.mult) * hc.mult);
+            }
+            if kda_layers == 0 || sparse_layers == 0 || hc_mult == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "GLM-5.3 finalization requires both KDA and sparse layers; kda={} sparse={} hc={}",
+                    kda_layers, sparse_layers, hc_mult
+                )));
+            }
+            (
+                graph.num_layers,
+                hc_mult,
+                max_hc_mix_width,
+                graph.hidden_size,
+            )
+        };
+
+        let alloc_u16 = |elements: usize, name: &str| {
+            self.device
+                .alloc_zeros::<u16>(elements.max(1))
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "alloc GLM-5.3 {} [{} x u16]: {:?}",
+                        name, elements, error
+                    ))
+                })
+        };
+        let alloc_f32 = |elements: usize, name: &str| {
+            self.device
+                .alloc_zeros::<f32>(elements.max(1))
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "alloc GLM-5.3 {} [{} x f32]: {:?}",
+                        name, elements, error
+                    ))
+                })
+        };
+        let hc_state_elems = hc_mult.checked_mul(hidden_size).ok_or_else(|| {
+            pyo3::exceptions::PyOverflowError::new_err("GLM-5.3 HC state overflow")
+        })?;
+        let workspace = Glm5NextDecodeWorkspace {
+            hc_mult,
+            max_hc_mix_width,
+            swiglu_limit,
+            d_hc_state: alloc_u16(hc_state_elems, "HC state")?,
+            d_hc_next: alloc_u16(hc_state_elems, "HC next state")?,
+            d_hc_inv_rms: alloc_f32(1, "HC inverse RMS")?,
+            d_hc_mixes: alloc_f32(max_hc_mix_width, "HC mixes")?,
+            d_hc_pre: alloc_f32(hc_mult, "HC pre weights")?,
+            d_hc_post: alloc_f32(hc_mult, "HC post weights")?,
+            d_hc_comb: alloc_f32(hc_mult * hc_mult, "HC combination")?,
+        };
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        graph.kv_max_seq = logical_max_seq;
+        graph.kv_max_seq_by_layer = graph
+            .layers
+            .iter()
+            .take(graph.num_layers)
+            .map(|layer| match &layer.attn {
+                GpuAttnConfig::MLA { .. } => logical_max_seq,
+                _ => 0,
+            })
+            .collect();
+        graph.glm5_next_decode_workspace = Some(workspace);
+        log::info!(
+            "GpuDecodeStore: finalized GLM-5.3 decode workspace layers={} capacity={} HC={} swiglu_limit={}",
+            layer_count,
+            logical_max_seq,
+            hc_mult,
+            swiglu_limit,
+        );
+        Ok(layer_count)
+    }
+
     /// Register the fail-closed DeepSeek Sparse Attention / IndexShare contract.
     ///
     /// This records validated ownership and dimensions only. It deliberately
@@ -33819,9 +34453,71 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Upgrade a validated NoPE DSA registration to GLM-5.3's learned
+    /// k-pool contract.  Keeping this explicit prevents a zero-RoPE GLM-5.3
+    /// layer from silently falling through the legacy per-token GLM indexer.
+    fn configure_glm5_next_dsa_kpool_layer(
+        &mut self,
+        layer_idx: usize,
+        index_kpool: usize,
+        index_kpool_compress: bool,
+        index_kpool_always_select_tail: bool,
+    ) -> PyResult<()> {
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let layer = graph.layers.get_mut(layer_idx).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "GLM-5.3 DSA layer {} is absent",
+                layer_idx
+            ))
+        })?;
+        let is_nope_mla = matches!(
+            &layer.attn,
+            GpuAttnConfig::MLA {
+                qk_rope_dim: 0,
+                q_lora_rank,
+                ..
+            } if *q_lora_rank > 0
+        );
+        let registration = layer.dsa_indexer.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Register DSA layer {} before configuring its GLM-5.3 k-pool",
+                layer_idx
+            ))
+        })?;
+        if !is_nope_mla
+            || registration.glm5_next_kpool.is_some()
+            || registration.qk_rope_head_dim != 0
+            || index_kpool < 2
+            || index_kpool > 32
+            || registration.index_topk % index_kpool != 0
+            || !index_kpool_compress
+            || !index_kpool_always_select_tail
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "GLM-5.3 DSA layer {} has an invalid/duplicate k-pool contract: pool={} topk={} compress={} tail={} rope={}",
+                layer_idx,
+                index_kpool,
+                registration.index_topk,
+                index_kpool_compress,
+                index_kpool_always_select_tail,
+                registration.qk_rope_head_dim,
+            )));
+        }
+        registration.glm5_next_kpool = Some(Glm5NextKpoolRegistration {
+            pool_size: index_kpool,
+            always_select_tail: index_kpool_always_select_tail,
+        });
+        Ok(())
+    }
+
     #[pyo3(signature = (
         owner_layer_idx, wq_b_wid, wk_wid, weights_proj_wid,
-        k_norm_weight_wid, k_norm_bias_wid, max_context_tokens
+        k_norm_weight_wid, k_norm_bias_wid, max_context_tokens,
+        index_kpool_compress_ape_wid=None,
+        index_kpool_compress_gate_wid=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn register_dsa_indexer_owner_resource(
@@ -33833,6 +34529,8 @@ impl GpuDecodeStore {
         k_norm_weight_wid: usize,
         k_norm_bias_wid: usize,
         max_context_tokens: usize,
+        index_kpool_compress_ape_wid: Option<usize>,
+        index_kpool_compress_gate_wid: Option<usize>,
     ) -> PyResult<()> {
         let weight_ids = DsaIndexerOwnerWeightIds {
             wq_b: wq_b_wid,
@@ -33841,7 +34539,7 @@ impl GpuDecodeStore {
             k_norm_weight: k_norm_weight_wid,
             k_norm_bias: k_norm_bias_wid,
         };
-        let (registration, key_cache_elems, topk_capacity) = {
+        let (registration, key_cache_elems, topk_capacity, kpool_plan) = {
             let graph = self
                 .graph
                 .as_ref()
@@ -33891,6 +34589,7 @@ impl GpuDecodeStore {
                     || shared.q_lora_rank != registration.q_lora_rank
                     || shared.hidden_size != registration.hidden_size
                     || shared.rope_interleave != registration.rope_interleave
+                    || shared.glm5_next_kpool != registration.glm5_next_kpool
                 {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "DSA owner layer {} has inconsistent active IndexShare registrations",
@@ -33898,14 +34597,87 @@ impl GpuDecodeStore {
                     )));
                 }
             }
-            let (key_cache_elems, topk_capacity) = validate_dsa_owner_weight_contract(
+            let (mut key_cache_elems, mut topk_capacity) = validate_dsa_owner_weight_contract(
                 &graph.weights,
                 &registration,
                 weight_ids,
                 max_context_tokens,
             )
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            (registration, key_cache_elems, topk_capacity)
+            let kpool_plan = match (
+                registration.glm5_next_kpool,
+                index_kpool_compress_ape_wid,
+                index_kpool_compress_gate_wid,
+            ) {
+                (Some(kpool), Some(ape_wid), Some(gate_wid)) => {
+                    let ape = graph.weights.get(ape_wid).ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "GLM-5.3 DSA owner {} APE weight id {} is absent",
+                            owner_layer_idx, ape_wid
+                        ))
+                    })?;
+                    let gate = graph.weights.get(gate_wid).ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "GLM-5.3 DSA owner {} compression-gate weight id {} is absent",
+                            owner_layer_idx, gate_wid
+                        ))
+                    })?;
+                    if ape.ptr == 0
+                        || ape.dtype != 0
+                        || (ape.rows, ape.cols) != (kpool.pool_size, registration.index_head_dim)
+                        || gate.ptr == 0
+                        || gate.dtype != 0
+                        || (gate.rows, gate.cols)
+                            != (registration.index_head_dim, registration.hidden_size)
+                    {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "GLM-5.3 DSA owner {} k-pool weights must be BF16 APE=[{},{}] gate=[{},{}]",
+                            owner_layer_idx,
+                            kpool.pool_size,
+                            registration.index_head_dim,
+                            registration.index_head_dim,
+                            registration.hidden_size,
+                        )));
+                    }
+                    let pool_capacity = max_context_tokens.div_ceil(kpool.pool_size);
+                    key_cache_elems = pool_capacity
+                        .checked_mul(registration.index_head_dim)
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyOverflowError::new_err(
+                                "GLM-5.3 pooled DSA key-cache size overflow",
+                            )
+                        })?;
+                    topk_capacity = registration
+                        .index_topk
+                        .checked_add(kpool.pool_size - 1)
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyOverflowError::new_err(
+                                "GLM-5.3 expanded DSA top-k capacity overflow",
+                            )
+                        })?;
+                    Some((
+                        kpool,
+                        ape_wid,
+                        gate_wid,
+                        pool_capacity,
+                        registration.index_topk / kpool.pool_size,
+                    ))
+                }
+                (None, None, None) => None,
+                (Some(_), _, _) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "GLM-5.3 DSA owner {} requires both k-pool checkpoint weights",
+                        owner_layer_idx
+                    )))
+                }
+                (None, _, _) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Legacy DSA owner {} received GLM-5.3-only k-pool weights",
+                        owner_layer_idx
+                    )))
+                }
+            };
+            (registration, key_cache_elems, topk_capacity, kpool_plan)
         };
 
         let d_key_cache = self
@@ -33914,7 +34686,13 @@ impl GpuDecodeStore {
             .map_err(|error| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "alloc DSA owner {} BF16 key cache [{} x {}]: {:?}",
-                    owner_layer_idx, max_context_tokens, registration.index_head_dim, error
+                    owner_layer_idx,
+                    kpool_plan
+                        .as_ref()
+                        .map(|(_, _, _, capacity, _)| *capacity)
+                        .unwrap_or(max_context_tokens),
+                    registration.index_head_dim,
+                    error
                 ))
             })?;
         let d_topk_indices = self
@@ -33927,8 +34705,63 @@ impl GpuDecodeStore {
                 ))
             })?;
 
+        let glm5_next_kpool =
+            if let Some((kpool, ape_wid, gate_wid, pool_capacity, pool_topk_capacity)) = kpool_plan
+            {
+                let tail_elems = kpool
+                    .pool_size
+                    .checked_mul(registration.index_head_dim)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyOverflowError::new_err(
+                            "GLM-5.3 k-pool tail size overflow",
+                        )
+                    })?;
+                Some(Glm5NextKpoolResource {
+                    ape_wid,
+                    gate_wid,
+                    pool_capacity,
+                    d_key_tail: self
+                        .device
+                        .alloc_zeros::<u16>(tail_elems)
+                        .map_err(|error| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "alloc GLM-5.3 DSA owner {} key tail: {:?}",
+                                owner_layer_idx, error
+                            ))
+                        })?,
+                    d_gate_tail: self
+                        .device
+                        .alloc_zeros::<u16>(tail_elems)
+                        .map_err(|error| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "alloc GLM-5.3 DSA owner {} gate tail: {:?}",
+                                owner_layer_idx, error
+                            ))
+                        })?,
+                    d_pool_topk_indices: self
+                        .device
+                        .alloc_zeros::<i32>(pool_topk_capacity.max(1))
+                        .map_err(|error| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "alloc GLM-5.3 DSA owner {} pool top-k: {:?}",
+                                owner_layer_idx, error
+                            ))
+                        })?,
+                })
+            } else {
+                None
+            };
+
         let key_ptr = *d_key_cache.device_ptr();
         let key_elements = d_key_cache.len();
+        let cache_rows = glm5_next_kpool
+            .as_ref()
+            .map(|resource| resource.pool_capacity)
+            .unwrap_or(max_context_tokens);
+        let logical_tokens_per_row = registration
+            .glm5_next_kpool
+            .map(|kpool| kpool.pool_size)
+            .unwrap_or(1);
         self.sequence_state_registry
             .register(crate::session_cache::SequenceStateAllocation {
                 name: format!("dsa.owner{}.key_cache", owner_layer_idx),
@@ -33939,18 +34772,55 @@ impl GpuDecodeStore {
                 storage_bytes: key_elements * std::mem::size_of::<u16>(),
                 dtype: "bfloat16".to_string(),
                 element_size: std::mem::size_of::<u16>(),
-                shape: vec![max_context_tokens, registration.index_head_dim],
+                shape: vec![cache_rows, registration.index_head_dim],
                 strides_bytes: vec![
                     registration.index_head_dim * std::mem::size_of::<u16>(),
                     std::mem::size_of::<u16>(),
                 ],
                 growth: crate::session_cache::SequenceStateGrowth::TokenRows {
-                    logical_tokens_per_row: 1,
-                    capacity_rows: max_context_tokens,
+                    logical_tokens_per_row,
+                    capacity_rows: cache_rows,
                     row_bytes: registration.index_head_dim * std::mem::size_of::<u16>(),
                 },
             })
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        if let Some(resource) = glm5_next_kpool.as_ref() {
+            for (suffix, ptr) in [
+                ("key_tail", *resource.d_key_tail.device_ptr()),
+                ("gate_tail", *resource.d_gate_tail.device_ptr()),
+            ] {
+                let elements = registration
+                    .glm5_next_kpool
+                    .expect("resource has a k-pool registration")
+                    .pool_size
+                    * registration.index_head_dim;
+                self.sequence_state_registry
+                    .register(crate::session_cache::SequenceStateAllocation {
+                        name: format!("dsa.owner{}.{}", owner_layer_idx, suffix),
+                        kind: format!("dsa_kpool_{}", suffix),
+                        layer_idx: Some(owner_layer_idx),
+                        device_ordinal: self.device.ordinal(),
+                        ptr,
+                        storage_bytes: elements * std::mem::size_of::<u16>(),
+                        dtype: "bfloat16".to_string(),
+                        element_size: std::mem::size_of::<u16>(),
+                        shape: vec![
+                            registration
+                                .glm5_next_kpool
+                                .expect("resource has a k-pool registration")
+                                .pool_size,
+                            registration.index_head_dim,
+                        ],
+                        strides_bytes: vec![
+                            registration.index_head_dim * std::mem::size_of::<u16>(),
+                            std::mem::size_of::<u16>(),
+                        ],
+                        growth: crate::session_cache::SequenceStateGrowth::Fixed,
+                    })
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+            }
+        }
 
         let graph = self
             .graph
@@ -33964,6 +34834,7 @@ impl GpuDecodeStore {
             topk_capacity,
             d_key_cache,
             d_topk_indices,
+            glm5_next_kpool,
         });
         log::info!(
             "GpuDecodeStore: staged DSA owner {} resource (context={}, key_dim={}, topk={}, weights=[{},{},{},{},{}])",
@@ -34029,7 +34900,18 @@ impl GpuDecodeStore {
                     "DSA IndexShare replica requires positive runtime context",
                 ));
             }
-            registration.index_topk.min(max_context_tokens)
+            if let Some(kpool) = registration.glm5_next_kpool {
+                registration
+                    .index_topk
+                    .checked_add(kpool.pool_size - 1)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyOverflowError::new_err(
+                            "GLM-5.3 DSA replica capacity overflow",
+                        )
+                    })?
+            } else {
+                registration.index_topk.min(max_context_tokens)
+            }
         };
 
         let d_topk_indices = self
@@ -34170,7 +35052,7 @@ impl GpuDecodeStore {
             let max_context_tokens = graph
                 .dsa_indexer_owners
                 .iter()
-                .map(|resource| resource.max_context_tokens)
+                .map(DsaIndexerOwnerResource::score_capacity)
                 .max()
                 .unwrap_or(0);
             let max_index_n_heads = active_registrations
@@ -34210,7 +35092,11 @@ impl GpuDecodeStore {
                             resource.owner_layer_idx
                         ))
                     })?;
-                let plan = plan_dsa_topk(resource.max_context_tokens, registration.index_topk)
+                let selected = registration
+                    .glm5_next_kpool
+                    .map(|kpool| registration.index_topk / kpool.pool_size)
+                    .unwrap_or(registration.index_topk);
+                let plan = plan_dsa_topk(resource.score_capacity(), selected)
                     .map_err(pyo3::exceptions::PyValueError::new_err)?;
                 max_topk_candidate_capacity =
                     max_topk_candidate_capacity.max(plan.candidate_capacity);
@@ -40171,6 +41057,176 @@ impl GpuDecodeStore {
 // ── Pure-Rust methods for GPU decode (no PyO3, used by Rust HTTP server) ──
 
 impl GpuDecodeStore {
+    pub(crate) fn is_glm5_next_runtime(&self) -> bool {
+        self.graph
+            .as_ref()
+            .is_some_and(|graph| graph.glm5_next_decode_workspace.is_some())
+    }
+
+    fn reset_glm5_next_sequence_state_rust(&mut self) -> Result<(), String> {
+        if !self.is_glm5_next_runtime() {
+            return Err(
+                "GLM-5.3 sequence reset requested for a different architecture".to_string(),
+            );
+        }
+        self.device
+            .bind_to_thread()
+            .map_err(|error| format!("bind CUDA context for GLM-5.3 sequence reset: {error}"))?;
+
+        // Fixed allocations are the recurrent/convolution states and learned
+        // k-pool tails. Token-row caches are overwritten at every live row and
+        // must not be cleared across their full (potentially 1M-token) capacity.
+        for allocation in self.sequence_state_registry.allocations() {
+            if !matches!(
+                allocation.growth,
+                crate::session_cache::SequenceStateGrowth::Fixed
+            ) {
+                continue;
+            }
+            let result = unsafe {
+                cuda_sys::lib().cuMemsetD8_v2(allocation.ptr, 0, allocation.storage_bytes)
+            };
+            if result != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!(
+                    "zero GLM-5.3 sequence state {} ({} bytes): {:?}",
+                    allocation.name, allocation.storage_bytes, result
+                ));
+            }
+        }
+        self.device
+            .synchronize()
+            .map_err(|error| format!("synchronize GLM-5.3 sequence reset: {error:?}"))?;
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| "GpuDecodeStore not configured".to_string())?;
+        graph.kv_current_pos = 0;
+        graph.rope_position_delta = 0;
+        self.active_sequence_device_checkpoint = None;
+        Ok(())
+    }
+
+    /// Correctness-first prompt encoder for GLM-5.3. It deliberately reuses
+    /// the native one-token graph so the first end-to-end qualification does
+    /// not depend on an unvalidated batched implementation.
+    pub(crate) fn glm5_next_sequential_encode_rust(
+        &mut self,
+        token_ids: &[u32],
+        sequence_start: usize,
+        reset_sequence_state: bool,
+    ) -> Result<(usize, f64), String> {
+        if !self.is_glm5_next_runtime() {
+            return Err(
+                "GLM-5.3 sequential prefill requested for a different architecture".to_string(),
+            );
+        }
+        if token_ids.is_empty() {
+            return Err("Empty token sequence".to_string());
+        }
+        if reset_sequence_state != (sequence_start == 0) {
+            return Err(format!(
+                "GLM-5.3 sequential prefill state mismatch: sequence_start={} reset_state={}",
+                sequence_start, reset_sequence_state
+            ));
+        }
+        if reset_sequence_state {
+            self.reset_glm5_next_sequence_state_rust()?;
+        } else {
+            let live_position = self
+                .graph
+                .as_ref()
+                .map(|graph| graph.kv_current_pos)
+                .ok_or_else(|| "GpuDecodeStore not configured".to_string())?;
+            if live_position != sequence_start {
+                return Err(format!(
+                    "GLM-5.3 continuation starts at {} but live sequence state is at {}",
+                    sequence_start, live_position
+                ));
+            }
+        }
+        let prompt_len = sequence_start
+            .checked_add(token_ids.len())
+            .ok_or_else(|| "GLM-5.3 prompt position overflows".to_string())?;
+        let capacity = self
+            .graph
+            .as_ref()
+            .map(|graph| graph.kv_max_seq)
+            .ok_or_else(|| "GpuDecodeStore not configured".to_string())?;
+        if prompt_len > capacity {
+            return Err(format!(
+                "GLM-5.3 KV cache exhausted: boundary {} + suffix {} exceeds capacity {}",
+                sequence_start,
+                token_ids.len(),
+                capacity
+            ));
+        }
+
+        let started = std::time::Instant::now();
+        for (offset, &token_id) in token_ids.iter().enumerate() {
+            let position = sequence_start + offset;
+            self.gpu_decode_step(token_id as usize, position)
+                .map_err(|error| {
+                    format!(
+                        "GLM-5.3 sequential prefill failed at absolute token {}: {}",
+                        position, error
+                    )
+                })?;
+        }
+        self.set_kv_position_rust(prompt_len);
+        Ok((prompt_len, started.elapsed().as_secs_f64() * 1000.0))
+    }
+
+    pub(crate) fn glm5_next_sample_current_logits_rust(
+        &mut self,
+        temperature: f32,
+        suppress_tokens: &[u32],
+    ) -> Result<usize, String> {
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| "GpuDecodeStore not configured".to_string())?;
+        if graph.glm5_next_decode_workspace.is_none() || graph.h_logits.len() < graph.vocab_size {
+            return Err("GLM-5.3 logits are unavailable after sequential prefill".to_string());
+        }
+        for &token_id in suppress_tokens {
+            if (token_id as usize) < graph.vocab_size {
+                graph.h_logits[token_id as usize] = f32::NEG_INFINITY;
+            }
+        }
+        let mut rng_state = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if rng_state == 0 {
+            rng_state = 0x9E37_79B9_7F4A_7C15;
+        }
+        let mut rng_next = move || -> u64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+        Ok(crate::decode::sample_from_logits_pub(
+            &mut graph.h_logits,
+            graph.vocab_size,
+            if temperature < 1e-6 { 0.0 } else { temperature },
+            0,
+            1.0,
+            &mut rng_next,
+        ))
+    }
+
+    pub(crate) fn glm5_next_logits_clone_rust(&self) -> Result<Vec<f32>, String> {
+        let graph = self
+            .graph
+            .as_ref()
+            .ok_or_else(|| "GpuDecodeStore not configured".to_string())?;
+        if graph.glm5_next_decode_workspace.is_none() {
+            return Err("GLM-5.3 logits requested for a different architecture".to_string());
+        }
+        Ok(graph.h_logits.clone())
+    }
+
     fn dspark_residency_counts_internal(
         &self,
     ) -> Result<(DsparkResidencyMode, usize, usize), String> {
@@ -40476,10 +41532,7 @@ impl GpuDecodeStore {
         label: &str,
     ) -> Result<(), String> {
         use cudarc::driver::LaunchConfig;
-        let workspace = graph
-            .deepseek_v4_decode_workspace
-            .as_ref()
-            .ok_or("DeepSeek-V4 decode workspace is not finalized")?;
+        let workspace = hyper_connection_decode_workspace_view(graph)?;
         let function = graph
             .weights
             .get(function_wid)
@@ -40532,7 +41585,7 @@ impl GpuDecodeStore {
                         shared_mem_bytes: reduction_threads * 4,
                     },
                     (
-                        *workspace.d_hc_inv_rms.device_ptr(),
+                        workspace.inv_rms_ptr,
                         state_ptr,
                         graph.hidden_size as i32,
                         mult as i32,
@@ -40551,10 +41604,10 @@ impl GpuDecodeStore {
                         shared_mem_bytes: reduction_threads * 4,
                     },
                     (
-                        *workspace.d_hc_mixes.device_ptr(),
+                        workspace.mixes_ptr,
                         state_ptr,
                         function.ptr,
-                        *workspace.d_hc_inv_rms.device_ptr(),
+                        workspace.inv_rms_ptr,
                         graph.hidden_size as i32,
                         mult as i32,
                         mix_width as i32,
@@ -40572,10 +41625,10 @@ impl GpuDecodeStore {
                         shared_mem_bytes: 0,
                     },
                     (
-                        *workspace.d_hc_pre.device_ptr(),
-                        *workspace.d_hc_post.device_ptr(),
-                        *workspace.d_hc_comb.device_ptr(),
-                        *workspace.d_hc_mixes.device_ptr(),
+                        workspace.pre_ptr,
+                        workspace.post_ptr,
+                        workspace.comb_ptr,
+                        workspace.mixes_ptr,
                         scale_ptr,
                         base_ptr,
                         mult as i32,
@@ -40610,7 +41663,7 @@ impl GpuDecodeStore {
                     (
                         hidden_out_ptr,
                         state_ptr,
-                        *workspace.d_hc_pre.device_ptr(),
+                        workspace.pre_ptr,
                         graph.hidden_size as i32,
                         mult as i32,
                     ),
@@ -40630,17 +41683,14 @@ impl GpuDecodeStore {
         mult: usize,
         label: &str,
     ) -> Result<(), String> {
-        let workspace = graph
-            .deepseek_v4_decode_workspace
-            .as_ref()
-            .ok_or("DeepSeek-V4 decode workspace is not finalized")?;
+        let workspace = hyper_connection_decode_workspace_view(graph)?;
         self.launch_deepseek_v4_hc_post_with_mix_for_graph(
             graph,
             output_state_ptr,
             sublayer_ptr,
             residual_state_ptr,
-            *workspace.d_hc_post.device_ptr(),
-            *workspace.d_hc_comb.device_ptr(),
+            workspace.post_ptr,
+            workspace.comb_ptr,
             mult,
             label,
         )
@@ -40659,10 +41709,7 @@ impl GpuDecodeStore {
         label: &str,
     ) -> Result<(), String> {
         use cudarc::driver::LaunchConfig;
-        let workspace = graph
-            .deepseek_v4_decode_workspace
-            .as_ref()
-            .ok_or("DeepSeek-V4 decode workspace is not finalized")?;
+        let workspace = hyper_connection_decode_workspace_view(graph)?;
         if output_state_ptr == 0
             || sublayer_ptr == 0
             || residual_state_ptr == 0
@@ -40722,10 +41769,7 @@ impl GpuDecodeStore {
         hidden_out_ptr: u64,
     ) -> Result<(), String> {
         use cudarc::driver::LaunchConfig;
-        let workspace = graph
-            .deepseek_v4_decode_workspace
-            .as_ref()
-            .ok_or("DeepSeek-V4 decode workspace is not finalized")?;
+        let workspace = hyper_connection_decode_workspace_view(graph)?;
         let function = graph
             .weights
             .get(head.fn_wid)
@@ -40761,7 +41805,7 @@ impl GpuDecodeStore {
                         shared_mem_bytes: reduction_threads * 4,
                     },
                     (
-                        *workspace.d_hc_inv_rms.device_ptr(),
+                        workspace.inv_rms_ptr,
                         state_ptr,
                         graph.hidden_size as i32,
                         head.mult as i32,
@@ -40779,10 +41823,10 @@ impl GpuDecodeStore {
                         shared_mem_bytes: reduction_threads * 4,
                     },
                     (
-                        *workspace.d_hc_mixes.device_ptr(),
+                        workspace.mixes_ptr,
                         state_ptr,
                         function.ptr,
-                        *workspace.d_hc_inv_rms.device_ptr(),
+                        workspace.inv_rms_ptr,
                         graph.hidden_size as i32,
                         head.mult as i32,
                         head.mult as i32,
@@ -40799,8 +41843,8 @@ impl GpuDecodeStore {
                         shared_mem_bytes: 0,
                     },
                     (
-                        *workspace.d_hc_pre.device_ptr(),
-                        *workspace.d_hc_mixes.device_ptr(),
+                        workspace.pre_ptr,
+                        workspace.mixes_ptr,
                         head.scale_ptr,
                         head.base_ptr,
                         head.mult as i32,
@@ -40833,7 +41877,7 @@ impl GpuDecodeStore {
                     (
                         hidden_out_ptr,
                         state_ptr,
-                        *workspace.d_hc_pre.device_ptr(),
+                        workspace.pre_ptr,
                         graph.hidden_size as i32,
                         head.mult as i32,
                     ),
@@ -40891,10 +41935,7 @@ impl GpuDecodeStore {
         graph: &GpuDecodeGraph,
     ) -> Result<(), String> {
         use cudarc::driver::LaunchConfig;
-        let workspace = graph
-            .deepseek_v4_decode_workspace
-            .as_ref()
-            .ok_or("DeepSeek-V4 decode workspace is not finalized")?;
+        let workspace = hyper_connection_decode_workspace_view(graph)?;
         let elems = graph
             .hidden_size
             .checked_mul(workspace.hc_mult)
@@ -40913,7 +41954,7 @@ impl GpuDecodeStore {
                 .launch(
                     LaunchConfig::for_num_elems(elems_u32),
                     (
-                        *workspace.d_hc_state.device_ptr(),
+                        workspace.state_ptr,
                         *graph.d_hidden.device_ptr(),
                         hidden_i32,
                         mult_i32,
@@ -41606,6 +42647,576 @@ impl GpuDecodeStore {
             radix_topk_enabled,
         )?;
         mark_index(10, "deepseek-v4-index-topk-end")?;
+        Ok(())
+    }
+
+    fn run_glm5_next_kda_attention_decode_for_graph(
+        &self,
+        graph: &GpuDecodeGraph,
+        layer_idx: usize,
+        hidden_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        use cudarc::driver::LaunchConfig;
+
+        let kda = match graph.layers.get(layer_idx).map(|layer| &layer.attn) {
+            Some(GpuAttnConfig::LinearAttention {
+                kda: Some(registration),
+                ..
+            }) => registration.clone(),
+            _ => {
+                return Err(format!(
+                    "GLM-5.3 layer {} has no KDA registration",
+                    layer_idx
+                ))
+            }
+        };
+        let width = kda
+            .num_heads
+            .checked_mul(kda.head_dim)
+            .ok_or_else(|| format!("GLM-5.3 KDA layer {} width overflow", layer_idx))?;
+        let conv_dim = width
+            .checked_mul(3)
+            .ok_or_else(|| format!("GLM-5.3 KDA layer {} conv width overflow", layer_idx))?;
+        let bf16_capacity = |f32_len: usize| f32_len.saturating_mul(2);
+        if hidden_ptr == 0
+            || output_ptr == 0
+            || bf16_capacity(graph.d_la_qkvz.len()) < conv_dim
+            || bf16_capacity(graph.d_la_conv_out.len()) < conv_dim
+            || bf16_capacity(graph.d_la_ba.len()) < width
+            || bf16_capacity(graph.d_la_gated_out.len()) < width
+            || bf16_capacity(graph.d_la_recur_out.len()) < width
+            || graph.d_scratch.len() < kda.head_dim.max(kda.num_heads)
+            || graph.d_moe_out.len() < kda.head_dim
+        {
+            return Err(format!(
+                "GLM-5.3 KDA layer {} scratch contract is too small for heads={} dim={}",
+                layer_idx, kda.num_heads, kda.head_dim
+            ));
+        }
+        let weight = |wid: usize, name: &str| -> Result<&GpuWeight, String> {
+            graph.weights.get(wid).ok_or_else(|| {
+                format!(
+                    "GLM-5.3 KDA layer {} {} weight {} is absent",
+                    layer_idx, name, wid
+                )
+            })
+        };
+        let qkv_ptr = *graph.d_la_qkvz.device_ptr();
+        let convolved_ptr = *graph.d_la_conv_out.device_ptr();
+        let forget_ptr = *graph.d_la_ba.device_ptr();
+        let output_gate_ptr = *graph.d_la_gated_out.device_ptr();
+        let attention_ptr = *graph.d_la_recur_out.device_ptr();
+        let small_ptr = *graph.d_scratch.device_ptr();
+        let secondary_small_ptr = *graph.d_moe_out.device_ptr();
+        let bf16_offset = |base: u64, elements: usize| -> Result<u64, String> {
+            base.checked_add(
+                u64::try_from(
+                    elements
+                        .checked_mul(std::mem::size_of::<u16>())
+                        .ok_or("GLM-5.3 KDA BF16 pointer offset overflow")?,
+                )
+                .map_err(|_| "GLM-5.3 KDA BF16 pointer offset exceeds u64")?,
+            )
+            .ok_or_else(|| "GLM-5.3 KDA BF16 pointer overflow".to_string())
+        };
+
+        self.gemv_bf16_internal(weight(kda.q_proj, "q_proj")?, hidden_ptr, qkv_ptr)?;
+        self.gemv_bf16_internal(
+            weight(kda.k_proj, "k_proj")?,
+            hidden_ptr,
+            bf16_offset(qkv_ptr, width)?,
+        )?;
+        self.gemv_bf16_internal(
+            weight(kda.v_proj, "v_proj")?,
+            hidden_ptr,
+            bf16_offset(qkv_ptr, width * 2)?,
+        )?;
+
+        let kernels = graph.kernels.as_ref().ok_or("kernels not cached")?;
+        let conv_elements = u32::try_from(conv_dim)
+            .map_err(|_| format!("GLM-5.3 KDA layer {} conv width exceeds u32", layer_idx))?;
+        unsafe {
+            kernels
+                .glm5_next_kda_conv_decode
+                .clone()
+                .launch(
+                    LaunchConfig::for_num_elems(conv_elements),
+                    (
+                        convolved_ptr,
+                        qkv_ptr,
+                        kda.conv_weight_ptr,
+                        kda.conv_state_ptr,
+                        i32::try_from(conv_dim).map_err(|_| {
+                            format!("GLM-5.3 KDA layer {} conv width exceeds i32", layer_idx)
+                        })?,
+                        i32::try_from(kda.kernel_dim).map_err(|_| {
+                            format!("GLM-5.3 KDA layer {} kernel width exceeds i32", layer_idx)
+                        })?,
+                    ),
+                )
+                .map_err(|error| {
+                    format!("GLM-5.3 KDA layer {} convolution: {:?}", layer_idx, error)
+                })?;
+        }
+        self.gemv_bf16_internal(weight(kda.f_a_proj, "f_a_proj")?, hidden_ptr, small_ptr)?;
+        self.gemv_bf16_internal(weight(kda.f_b_proj, "f_b_proj")?, small_ptr, forget_ptr)?;
+        self.gemv_bf16_internal(weight(kda.b_proj, "b_proj")?, hidden_ptr, small_ptr)?;
+        self.gemv_bf16_internal(
+            weight(kda.g_a_proj, "g_a_proj")?,
+            hidden_ptr,
+            secondary_small_ptr,
+        )?;
+        self.gemv_bf16_internal(
+            weight(kda.g_b_proj, "g_b_proj")?,
+            secondary_small_ptr,
+            output_gate_ptr,
+        )?;
+
+        let head_dim_u32 = u32::try_from(kda.head_dim)
+            .map_err(|_| format!("GLM-5.3 KDA layer {} head dim exceeds u32", layer_idx))?;
+        let shared_mem_bytes = head_dim_u32
+            .checked_mul(4)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u32))
+            .ok_or_else(|| format!("GLM-5.3 KDA layer {} shared-memory overflow", layer_idx))?;
+        let num_heads_u32 = u32::try_from(kda.num_heads)
+            .map_err(|_| format!("GLM-5.3 KDA layer {} head count exceeds u32", layer_idx))?;
+        let mut a0 = attention_ptr;
+        let mut a1 = convolved_ptr;
+        let mut a2 = forget_ptr;
+        let mut a3 = small_ptr;
+        let mut a4 = output_gate_ptr;
+        let mut a5 = kda.a_log_ptr;
+        let mut a6 = kda.dt_bias_ptr;
+        let mut a7 = kda.o_norm_ptr;
+        let mut a8 = kda.recur_state_ptr;
+        let mut a9 = i32::try_from(kda.num_heads)
+            .map_err(|_| format!("GLM-5.3 KDA layer {} heads exceed i32", layer_idx))?;
+        let mut a10 = i32::try_from(kda.head_dim)
+            .map_err(|_| format!("GLM-5.3 KDA layer {} head dim exceeds i32", layer_idx))?;
+        let mut a11 = kda.query_scale;
+        let mut a12 = kda.gate_lower_bound;
+        let mut a13 = kda.norm_eps;
+        let mut params: Vec<*mut std::ffi::c_void> = vec![
+            &mut a0 as *mut _ as *mut std::ffi::c_void,
+            &mut a1 as *mut _ as *mut std::ffi::c_void,
+            &mut a2 as *mut _ as *mut std::ffi::c_void,
+            &mut a3 as *mut _ as *mut std::ffi::c_void,
+            &mut a4 as *mut _ as *mut std::ffi::c_void,
+            &mut a5 as *mut _ as *mut std::ffi::c_void,
+            &mut a6 as *mut _ as *mut std::ffi::c_void,
+            &mut a7 as *mut _ as *mut std::ffi::c_void,
+            &mut a8 as *mut _ as *mut std::ffi::c_void,
+            &mut a9 as *mut _ as *mut std::ffi::c_void,
+            &mut a10 as *mut _ as *mut std::ffi::c_void,
+            &mut a11 as *mut _ as *mut std::ffi::c_void,
+            &mut a12 as *mut _ as *mut std::ffi::c_void,
+            &mut a13 as *mut _ as *mut std::ffi::c_void,
+        ];
+        unsafe {
+            kernels
+                .glm5_next_kda_recurrent_decode
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (num_heads_u32, 1, 1),
+                        block_dim: (head_dim_u32, 1, 1),
+                        shared_mem_bytes,
+                    },
+                    &mut params,
+                )
+                .map_err(|error| {
+                    format!("GLM-5.3 KDA layer {} recurrence: {:?}", layer_idx, error)
+                })?;
+        }
+        self.gemv_bf16_internal(weight(kda.o_proj, "o_proj")?, attention_ptr, output_ptr)?;
+        Ok(())
+    }
+
+    fn run_glm5_next_dense_mlp_decode_for_graph(
+        &self,
+        graph: &GpuDecodeGraph,
+        layer_idx: usize,
+        input_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        use cudarc::driver::LaunchConfig;
+
+        let (gate_proj, up_proj, down_proj) =
+            match graph.layers.get(layer_idx).map(|layer| &layer.mlp) {
+                Some(GpuMlpConfig::Dense {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                }) => (*gate_proj, *up_proj, *down_proj),
+                _ => {
+                    return Err(format!(
+                        "GLM-5.3 layer {} has no dense MLP registration",
+                        layer_idx
+                    ))
+                }
+            };
+        let gate = graph
+            .weights
+            .get(gate_proj)
+            .ok_or_else(|| format!("GLM-5.3 dense layer {} gate weight is absent", layer_idx))?;
+        let up = graph
+            .weights
+            .get(up_proj)
+            .ok_or_else(|| format!("GLM-5.3 dense layer {} up weight is absent", layer_idx))?;
+        let down = graph
+            .weights
+            .get(down_proj)
+            .ok_or_else(|| format!("GLM-5.3 dense layer {} down weight is absent", layer_idx))?;
+        let intermediate = gate.rows;
+        if input_ptr == 0
+            || output_ptr == 0
+            || gate.dtype != 0
+            || up.dtype != 0
+            || down.dtype != 0
+            || gate.cols != graph.hidden_size
+            || up.cols != graph.hidden_size
+            || up.rows != intermediate
+            || down.cols != intermediate
+            || down.rows != graph.hidden_size
+            || graph.d_expert_gate_up.len() < intermediate.saturating_mul(2)
+            || graph.d_expert_scratch.len() < intermediate
+        {
+            return Err(format!(
+                "GLM-5.3 dense layer {} has an invalid BF16/scratch contract",
+                layer_idx
+            ));
+        }
+        let gate_up_ptr = *graph.d_expert_gate_up.device_ptr();
+        let up_out_ptr = gate_up_ptr
+            .checked_add(
+                u64::try_from(
+                    intermediate
+                        .checked_mul(std::mem::size_of::<u16>())
+                        .ok_or("GLM-5.3 dense MLP pointer offset overflow")?,
+                )
+                .map_err(|_| "GLM-5.3 dense MLP pointer offset exceeds u64")?,
+            )
+            .ok_or("GLM-5.3 dense MLP pointer overflow")?;
+        self.gemv_bf16_internal(gate, input_ptr, gate_up_ptr)?;
+        self.gemv_bf16_internal(up, input_ptr, up_out_ptr)?;
+        let kernels = graph.kernels.as_ref().ok_or("kernels not cached")?;
+        let swiglu_limit = graph
+            .glm5_next_decode_workspace
+            .as_ref()
+            .ok_or("GLM-5.3 decode workspace is absent")?
+            .swiglu_limit;
+        unsafe {
+            kernels
+                .deepseek_v4_swiglu_bf16
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        *graph.d_expert_scratch.device_ptr(),
+                        gate_up_ptr,
+                        i32::try_from(intermediate).map_err(|_| {
+                            format!("GLM-5.3 dense layer {} width exceeds i32", layer_idx)
+                        })?,
+                        swiglu_limit,
+                    ),
+                )
+                .map_err(|error| {
+                    format!(
+                        "GLM-5.3 dense layer {} clamped SwiGLU: {:?}",
+                        layer_idx, error
+                    )
+                })?;
+        }
+        self.gemv_bf16_internal(down, *graph.d_expert_scratch.device_ptr(), output_ptr)?;
+        Ok(())
+    }
+
+    fn run_glm5_next_nope_sparse_mla_decode_for_graph(
+        &self,
+        graph: &GpuDecodeGraph,
+        layer_idx: usize,
+        position: usize,
+        hidden_ptr: u64,
+        output_ptr: u64,
+    ) -> Result<(), String> {
+        use cudarc::driver::LaunchConfig;
+
+        let (
+            q_a_proj,
+            q_b_proj,
+            q_a_norm_ptr,
+            kv_a_proj,
+            kv_a_norm_ptr,
+            w_kc_ptr,
+            w_vc_ptr,
+            o_proj,
+            num_heads,
+            kv_lora_rank,
+            ckv_cache_dim,
+            qk_nope_dim,
+            v_head_dim,
+            q_lora_rank,
+            sm_scale,
+            ckv_cache_ptr,
+            kpe_cache_ptr,
+        ) = match graph.layers.get(layer_idx).map(|layer| &layer.attn) {
+            Some(GpuAttnConfig::MLA {
+                q_a_proj: Some(q_a_proj),
+                q_b_proj: Some(q_b_proj),
+                q_a_norm_ptr,
+                q_proj: None,
+                kv_a_proj,
+                kv_a_norm_ptr,
+                w_kc_ptr,
+                w_vc_ptr,
+                o_proj,
+                num_heads,
+                kv_lora_rank,
+                ckv_cache_dim,
+                qk_nope_dim,
+                qk_rope_dim: 0,
+                v_head_dim,
+                q_lora_rank,
+                sm_scale,
+                ckv_cache_ptr,
+                kpe_cache_ptr,
+                ..
+            }) if *q_lora_rank > 0 => (
+                *q_a_proj,
+                *q_b_proj,
+                *q_a_norm_ptr,
+                *kv_a_proj,
+                *kv_a_norm_ptr,
+                *w_kc_ptr,
+                *w_vc_ptr,
+                *o_proj,
+                *num_heads,
+                *kv_lora_rank,
+                *ckv_cache_dim,
+                *qk_nope_dim,
+                *v_head_dim,
+                *q_lora_rank,
+                *sm_scale,
+                *ckv_cache_ptr,
+                *kpe_cache_ptr,
+            ),
+            _ => {
+                return Err(format!(
+                    "GLM-5.3 layer {} has no NoPE q-LoRA MLA registration",
+                    layer_idx
+                ))
+            }
+        };
+        if hidden_ptr == 0
+            || output_ptr == 0
+            || q_a_norm_ptr == 0
+            || kv_a_norm_ptr == 0
+            || w_kc_ptr == 0
+            || w_vc_ptr == 0
+            || ckv_cache_ptr == 0
+            || num_heads == 0
+            || kv_lora_rank == 0
+            || ckv_cache_dim < kv_lora_rank
+            || ckv_cache_dim % 16 != 0
+            || qk_nope_dim == 0
+            || v_head_dim == 0
+            || q_lora_rank == 0
+            || !sm_scale.is_finite()
+            || sm_scale <= 0.0
+        {
+            return Err(format!(
+                "GLM-5.3 NoPE MLA layer {} has an invalid geometry/cache contract",
+                layer_idx
+            ));
+        }
+        let weight = |wid: usize, name: &str| -> Result<&GpuWeight, String> {
+            let value = graph
+                .weights
+                .get(wid)
+                .ok_or_else(|| format!("GLM-5.3 MLA layer {} {} is absent", layer_idx, name))?;
+            if value.dtype != 0 {
+                return Err(format!(
+                    "GLM-5.3 MLA layer {} {} must be materialized as BF16 for the correctness path; dtype={}",
+                    layer_idx, name, value.dtype
+                ));
+            }
+            Ok(value)
+        };
+        let q_a = weight(q_a_proj, "q_a_proj")?;
+        let q_b = weight(q_b_proj, "q_b_proj")?;
+        let kv_a = weight(kv_a_proj, "kv_a_proj_with_mqa")?;
+        let o = weight(o_proj, "o_proj")?;
+        if (q_a.rows, q_a.cols) != (q_lora_rank, graph.hidden_size)
+            || (q_b.rows, q_b.cols) != (num_heads * qk_nope_dim, q_lora_rank)
+            || (kv_a.rows, kv_a.cols) != (kv_lora_rank, graph.hidden_size)
+            || (o.rows, o.cols) != (graph.hidden_size, num_heads * v_head_dim)
+        {
+            return Err(format!(
+                "GLM-5.3 NoPE MLA layer {} projection geometry mismatch",
+                layer_idx
+            ));
+        }
+        let kernels = graph.kernels.as_ref().ok_or("kernels not cached")?;
+
+        // Q-LoRA latent.  The normalized BF16 latent is shared with the DSA
+        // indexer exactly as in the official model.
+        self.gemv_bf16_to_f32_internal(q_a, hidden_ptr, *graph.d_gqa_q.device_ptr())?;
+        unsafe {
+            kernels
+                .per_head_rmsnorm
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        *graph.d_gqa_q.device_ptr(),
+                        q_a_norm_ptr,
+                        graph.eps,
+                        1i32,
+                        i32::try_from(q_lora_rank)
+                            .map_err(|_| "GLM-5.3 q-LoRA rank exceeds i32")?,
+                        0i32,
+                    ),
+                )
+                .map_err(|error| format!("GLM-5.3 MLA layer {} Q norm: {:?}", layer_idx, error))?;
+        }
+        self.launch_fp32_to_bf16(
+            *graph.d_scratch.device_ptr(),
+            *graph.d_gqa_q.device_ptr(),
+            q_lora_rank,
+        )?;
+        let logical_context = self.execute_dsa_owner_scores_for_graph(
+            graph,
+            layer_idx,
+            position,
+            hidden_ptr,
+            *graph.d_scratch.device_ptr(),
+        )?;
+        self.execute_dsa_owner_topk_for_graph(graph, layer_idx, logical_context)?;
+        self.gemv_bf16_to_f32_internal(
+            q_b,
+            *graph.d_scratch.device_ptr(),
+            *graph.d_gqa_q.device_ptr(),
+        )?;
+
+        // NoPE means the KV-A projection contains only the compressed latent.
+        self.gemv_bf16_to_f32_internal(kv_a, hidden_ptr, *graph.d_mla_kv.device_ptr())?;
+        unsafe {
+            kernels
+                .per_head_rmsnorm
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        *graph.d_mla_kv.device_ptr(),
+                        kv_a_norm_ptr,
+                        graph.eps,
+                        1i32,
+                        i32::try_from(kv_lora_rank)
+                            .map_err(|_| "GLM-5.3 KV-LoRA rank exceeds i32")?,
+                        0i32,
+                    ),
+                )
+                .map_err(|error| format!("GLM-5.3 MLA layer {} KV norm: {:?}", layer_idx, error))?;
+            kernels
+                .mla_absorb_wkc
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (
+                            u32::try_from(num_heads).map_err(|_| "GLM-5.3 MLA heads exceed u32")?,
+                            1,
+                            1,
+                        ),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        *graph.d_mla_q_absorbed.device_ptr(),
+                        *graph.d_gqa_q.device_ptr(),
+                        w_kc_ptr,
+                        i32::try_from(num_heads).map_err(|_| "GLM-5.3 MLA heads exceed i32")?,
+                        i32::try_from(qk_nope_dim)
+                            .map_err(|_| "GLM-5.3 MLA NoPE width exceeds i32")?,
+                        i32::try_from(ckv_cache_dim)
+                            .map_err(|_| "GLM-5.3 MLA cache width exceeds i32")?,
+                    ),
+                )
+                .map_err(|error| {
+                    format!("GLM-5.3 MLA layer {} absorb WKC: {:?}", layer_idx, error)
+                })?;
+        }
+
+        let cache_blocks = ckv_cache_dim / 16;
+        unsafe {
+            kernels
+                .mla_kv_cache_write_k4
+                .clone()
+                .launch(
+                    LaunchConfig::for_num_elems(
+                        u32::try_from(cache_blocks)
+                            .map_err(|_| "GLM-5.3 MLA cache blocks exceed u32")?,
+                    ),
+                    (
+                        ckv_cache_ptr,
+                        kpe_cache_ptr,
+                        *graph.d_mla_kv.device_ptr(),
+                        *graph.d_gqa_v.device_ptr(),
+                        i32::try_from(position).map_err(|_| "GLM-5.3 MLA position exceeds i32")?,
+                        i32::try_from(kv_lora_rank)
+                            .map_err(|_| "GLM-5.3 KV-LoRA rank exceeds i32")?,
+                        i32::try_from(ckv_cache_dim)
+                            .map_err(|_| "GLM-5.3 MLA cache width exceeds i32")?,
+                        0i32,
+                    ),
+                )
+                .map_err(|error| {
+                    format!("GLM-5.3 MLA layer {} cache write: {:?}", layer_idx, error)
+                })?;
+        }
+        self.launch_mla_sparse_attention_k4_for_layer(graph, layer_idx, position + 1)?;
+        unsafe {
+            kernels
+                .mla_apply_wvc
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (
+                            u32::try_from(num_heads).map_err(|_| "GLM-5.3 MLA heads exceed u32")?,
+                            1,
+                            1,
+                        ),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        *graph.d_scratch.device_ptr(),
+                        *graph.d_mla_attn_out.device_ptr(),
+                        w_vc_ptr,
+                        i32::try_from(num_heads).map_err(|_| "GLM-5.3 MLA heads exceed i32")?,
+                        i32::try_from(v_head_dim)
+                            .map_err(|_| "GLM-5.3 MLA value width exceeds i32")?,
+                        i32::try_from(ckv_cache_dim)
+                            .map_err(|_| "GLM-5.3 MLA cache width exceeds i32")?,
+                    ),
+                )
+                .map_err(|error| {
+                    format!("GLM-5.3 MLA layer {} apply WVC: {:?}", layer_idx, error)
+                })?;
+        }
+        self.gemv_bf16_internal(o, *graph.d_scratch.device_ptr(), output_ptr)?;
         Ok(())
     }
 
@@ -42507,6 +44118,15 @@ impl GpuDecodeStore {
                     owner_layer_idx
                 )
             })?;
+        if registration.glm5_next_kpool.is_some() {
+            return self.execute_glm5_next_kpool_scores_for_graph(
+                graph,
+                owner_layer_idx,
+                position,
+                hidden_ptr,
+                q_lora_ptr,
+            );
+        }
         if !registration.rope_interleave {
             return Err(format!(
                 "GLM DSA owner layer {} requires interleaved indexer RoPE",
@@ -42729,6 +44349,194 @@ impl GpuDecodeStore {
                 })?;
         }
         Ok(context)
+    }
+
+    fn execute_glm5_next_kpool_scores_for_graph(
+        &self,
+        graph: &GpuDecodeGraph,
+        owner_layer_idx: usize,
+        position: usize,
+        hidden_ptr: u64,
+        q_lora_ptr: u64,
+    ) -> Result<usize, String> {
+        use cudarc::driver::LaunchConfig;
+
+        let registration = graph
+            .layers
+            .iter()
+            .filter_map(|layer| layer.dsa_indexer.as_ref())
+            .find(|registration| registration.owner_layer_idx == owner_layer_idx)
+            .ok_or_else(|| {
+                format!(
+                    "GLM-5.3 DSA owner layer {} has no active registration",
+                    owner_layer_idx
+                )
+            })?;
+        let kpool = registration.glm5_next_kpool.ok_or_else(|| {
+            format!(
+                "GLM-5.3 DSA owner layer {} has no k-pool registration",
+                owner_layer_idx
+            )
+        })?;
+        let resource = graph
+            .dsa_indexer_owners
+            .iter()
+            .find(|resource| resource.owner_layer_idx == owner_layer_idx)
+            .ok_or_else(|| format!("GLM-5.3 DSA owner {} resource is absent", owner_layer_idx))?;
+        let pool_resource = resource.glm5_next_kpool.as_ref().ok_or_else(|| {
+            format!(
+                "GLM-5.3 DSA owner {} k-pool resource is absent",
+                owner_layer_idx
+            )
+        })?;
+        let workspace = graph
+            .dsa_indexer_workspace
+            .as_ref()
+            .ok_or("GLM-5.3 DSA workspace is not finalized")?;
+        if position >= resource.max_context_tokens
+            || pool_resource.pool_capacity > workspace.max_context_tokens
+            || registration.index_n_heads > workspace.max_index_n_heads
+            || registration.index_head_dim > workspace.max_index_head_dim
+        {
+            return Err(format!(
+                "GLM-5.3 DSA owner {} position/capacity exceeds finalized resources",
+                owner_layer_idx
+            ));
+        }
+        let weights = &graph.weights;
+        let wq_b = weights
+            .get(resource.weight_ids.wq_b)
+            .ok_or("GLM-5.3 DSA query weight is absent")?;
+        let wk = weights
+            .get(resource.weight_ids.wk)
+            .ok_or("GLM-5.3 DSA key weight is absent")?;
+        let weights_proj = weights
+            .get(resource.weight_ids.weights_proj)
+            .ok_or("GLM-5.3 DSA head-weight projection is absent")?;
+        let k_norm_weight = weights
+            .get(resource.weight_ids.k_norm_weight)
+            .ok_or("GLM-5.3 DSA key norm weight is absent")?;
+        let k_norm_bias = weights
+            .get(resource.weight_ids.k_norm_bias)
+            .ok_or("GLM-5.3 DSA key norm bias is absent")?;
+        let ape = weights
+            .get(pool_resource.ape_wid)
+            .ok_or("GLM-5.3 DSA learned APE is absent")?;
+        let gate = weights
+            .get(pool_resource.gate_wid)
+            .ok_or("GLM-5.3 DSA compression gate is absent")?;
+
+        self.gemv_bf16_internal(wq_b, q_lora_ptr, *workspace.d_projected_query.device_ptr())?;
+        self.gemv_bf16_internal(wk, hidden_ptr, *workspace.d_raw_key.device_ptr())?;
+        self.gemv_bf16_internal(gate, hidden_ptr, *workspace.d_query_rope.device_ptr())?;
+        self.gemv_bf16_internal(
+            weights_proj,
+            hidden_ptr,
+            *workspace.d_head_weights.device_ptr(),
+        )?;
+
+        let kernels = graph.kernels.as_ref().ok_or("kernels not cached")?;
+        unsafe {
+            kernels
+                .glm5_next_kpool_update
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 64 * std::mem::size_of::<f32>() as u32,
+                    },
+                    (
+                        *resource.d_key_cache.device_ptr(),
+                        *pool_resource.d_key_tail.device_ptr(),
+                        *pool_resource.d_gate_tail.device_ptr(),
+                        *workspace.d_raw_key.device_ptr(),
+                        *workspace.d_query_rope.device_ptr(),
+                        k_norm_weight.ptr,
+                        k_norm_bias.ptr,
+                        ape.ptr,
+                        i32::try_from(position).map_err(|_| "GLM-5.3 DSA position exceeds i32")?,
+                        i32::try_from(registration.index_head_dim)
+                            .map_err(|_| "GLM-5.3 DSA head dim exceeds i32")?,
+                        i32::try_from(kpool.pool_size)
+                            .map_err(|_| "GLM-5.3 DSA pool size exceeds i32")?,
+                        DSA_INDEXER_LAYER_NORM_EPS,
+                    ),
+                )
+                .map_err(|error| {
+                    format!(
+                        "GLM-5.3 DSA owner {} pool update: {:?}",
+                        owner_layer_idx, error
+                    )
+                })?;
+        }
+
+        let pool_count = (position + 1) / kpool.pool_size;
+        if pool_count > 0 {
+            let pool_count_i32 =
+                i32::try_from(pool_count).map_err(|_| "GLM-5.3 DSA pool count exceeds i32")?;
+            let heads_i32 = i32::try_from(registration.index_n_heads)
+                .map_err(|_| "GLM-5.3 DSA head count exceeds i32")?;
+            let dim_i32 = i32::try_from(registration.index_head_dim)
+                .map_err(|_| "GLM-5.3 DSA head dim exceeds i32")?;
+            let alpha = 1.0f32;
+            let beta = 0.0f32;
+            unsafe {
+                cublas_result::gemm_ex(
+                    *self.blas.handle(),
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    pool_count_i32,
+                    heads_i32,
+                    dim_i32,
+                    &alpha as *const f32 as *const std::ffi::c_void,
+                    *resource.d_key_cache.device_ptr() as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF,
+                    dim_i32,
+                    *workspace.d_projected_query.device_ptr() as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF,
+                    dim_i32,
+                    &beta as *const f32 as *const std::ffi::c_void,
+                    *workspace.d_head_scores.device_ptr() as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_32F,
+                    pool_count_i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+                .map_err(|error| {
+                    format!(
+                        "GLM-5.3 DSA owner {} pooled score GEMM: {:?}",
+                        owner_layer_idx, error
+                    )
+                })?;
+                kernels
+                    .dsa_reduce_weighted_scores
+                    .clone()
+                    .launch(
+                        LaunchConfig::for_num_elems(
+                            u32::try_from(pool_count)
+                                .map_err(|_| "GLM-5.3 DSA pool count exceeds u32")?,
+                        ),
+                        (
+                            *workspace.d_scores.device_ptr(),
+                            *workspace.d_head_scores.device_ptr(),
+                            *workspace.d_head_weights.device_ptr(),
+                            pool_count_i32,
+                            heads_i32,
+                            1.0f32
+                                / ((registration.index_head_dim as f32).sqrt()
+                                    * (registration.index_n_heads as f32).sqrt()),
+                        ),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "GLM-5.3 DSA owner {} pooled score reduction: {:?}",
+                            owner_layer_idx, error
+                        )
+                    })?;
+            }
+        }
+        Ok(position + 1)
     }
 
     fn execute_dsa_owner_scores_graphable(
@@ -43409,9 +45217,8 @@ impl GpuDecodeStore {
             };
         if num_heads == 0
             || ckv_cache_dim == 0
-            || qk_rope_dim == 0
             || ckv_cache_ptr == 0
-            || kpe_cache_ptr == 0
+            || (qk_rope_dim > 0 && kpe_cache_ptr == 0)
         {
             return Err(format!(
                 "DSA layer {} has incomplete sparse MLA geometry or cache pointers",
@@ -43537,9 +45344,8 @@ impl GpuDecodeStore {
             };
         if num_heads == 0
             || ckv_cache_dim == 0
-            || qk_rope_dim == 0
             || ckv_cache_ptr == 0
-            || kpe_cache_ptr == 0
+            || (qk_rope_dim > 0 && kpe_cache_ptr == 0)
         {
             return Err(format!(
                 "DSA layer {} has incomplete sparse MLA geometry or cache pointers",
@@ -43667,25 +45473,100 @@ impl GpuDecodeStore {
                 owner_layer_idx, context, resource.max_context_tokens
             ));
         }
-        let plan = plan_dsa_topk(context, registration.index_topk)?;
-        if plan.selected > resource.topk_capacity {
-            return Err(format!(
-                "DSA owner layer {} selected count {} exceeds retained top-k capacity {}",
-                owner_layer_idx, plan.selected, resource.topk_capacity
-            ));
-        }
+        let (score_context, selection_limit, selected_output_ptr, selected_output_capacity) =
+            if let Some(kpool) = registration.glm5_next_kpool {
+                if context == 0 || !kpool.always_select_tail {
+                    return Err(format!(
+                        "GLM-5.3 DSA owner {} requires positive context and tail selection",
+                        owner_layer_idx
+                    ));
+                }
+                let pool_resource = resource.glm5_next_kpool.as_ref().ok_or_else(|| {
+                    format!(
+                        "GLM-5.3 DSA owner {} pool resource is absent",
+                        owner_layer_idx
+                    )
+                })?;
+                (
+                    context / kpool.pool_size,
+                    registration.index_topk / kpool.pool_size,
+                    *pool_resource.d_pool_topk_indices.device_ptr(),
+                    pool_resource.d_pool_topk_indices.len(),
+                )
+            } else {
+                (
+                    context,
+                    registration.index_topk,
+                    *resource.d_topk_indices.device_ptr(),
+                    resource.topk_capacity,
+                )
+            };
         let workspace = graph
             .dsa_indexer_workspace
             .as_ref()
             .ok_or("DSA indexer workspace is not finalized")?;
-        if context > workspace.max_context_tokens
+        let kernels = graph.kernels.as_ref().ok_or("kernels not cached")?;
+        if score_context == 0 {
+            let kpool = registration
+                .glm5_next_kpool
+                .ok_or("legacy DSA cannot select top-k from an empty context")?;
+            let pool_resource = resource
+                .glm5_next_kpool
+                .as_ref()
+                .ok_or("GLM-5.3 DSA pool resource is absent")?;
+            unsafe {
+                kernels
+                    .glm5_next_kpool_expand_indices
+                    .clone()
+                    .launch(
+                        LaunchConfig::for_num_elems(
+                            u32::try_from(resource.topk_capacity)
+                                .map_err(|_| "GLM-5.3 expanded top-k exceeds u32")?,
+                        ),
+                        (
+                            *resource.d_topk_indices.device_ptr(),
+                            *pool_resource.d_pool_topk_indices.device_ptr(),
+                            0i32,
+                            i32::try_from(context - 1)
+                                .map_err(|_| "GLM-5.3 DSA position exceeds i32")?,
+                            i32::try_from(kpool.pool_size)
+                                .map_err(|_| "GLM-5.3 DSA pool size exceeds i32")?,
+                            i32::try_from(resource.topk_capacity)
+                                .map_err(|_| "GLM-5.3 expanded top-k exceeds i32")?,
+                        ),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "GLM-5.3 DSA owner {} tail-only expansion: {:?}",
+                            owner_layer_idx, error
+                        )
+                    })?;
+            }
+            return Ok(DsaTopkPlan {
+                context: 0,
+                selected: 0,
+                sort_width: 0,
+                initial_runs: 0,
+                merge_passes: 0,
+                candidate_capacity: 0,
+                shared_bytes: 0,
+            });
+        }
+        let plan = plan_dsa_topk(score_context, selection_limit)?;
+        if plan.selected > selected_output_capacity {
+            return Err(format!(
+                "DSA owner layer {} selected count {} exceeds retained top-k capacity {}",
+                owner_layer_idx, plan.selected, selected_output_capacity
+            ));
+        }
+        if score_context > workspace.max_context_tokens
             || plan.candidate_capacity > workspace.max_topk_candidate_capacity
             || plan.shared_bytes > workspace.max_topk_shared_bytes
         {
             return Err(format!(
                 "DSA owner {} top-k plan exceeds finalized workspace: plan=[context={}, candidates={}, shared={}] workspace=[context={}, candidates={}, shared={}]",
                 owner_layer_idx,
-                context,
+                score_context,
                 plan.candidate_capacity,
                 plan.shared_bytes,
                 workspace.max_context_tokens,
@@ -43693,8 +45574,12 @@ impl GpuDecodeStore {
                 workspace.max_topk_shared_bytes,
             ));
         }
-        let context_i32 = i32::try_from(context)
-            .map_err(|_| format!("DSA top-k context {} exceeds native i32 range", context))?;
+        let context_i32 = i32::try_from(score_context).map_err(|_| {
+            format!(
+                "DSA top-k context {} exceeds native i32 range",
+                score_context
+            )
+        })?;
         let selected_i32 = i32::try_from(plan.selected).map_err(|_| {
             format!(
                 "DSA selected top-k {} exceeds native i32 range",
@@ -43721,13 +45606,8 @@ impl GpuDecodeStore {
         })?;
         let block_threads = u32::try_from(plan.sort_width.min(256).max(1))
             .map_err(|_| "DSA top-k block width exceeds native u32 range".to_string())?;
-        let kernels = graph.kernels.as_ref().ok_or("kernels not cached")?;
-
         let (base_scores_ptr, base_indices_ptr) = if plan.initial_runs == 1 {
-            (
-                *workspace.d_scores.device_ptr(),
-                *resource.d_topk_indices.device_ptr(),
-            )
+            (*workspace.d_scores.device_ptr(), selected_output_ptr)
         } else {
             let scores = workspace
                 .d_topk_scores_a
@@ -43761,7 +45641,7 @@ impl GpuDecodeStore {
                 .map_err(|error| {
                     format!(
                         "DSA owner {} top-k base sort (context={}, selected={}, runs={}): {:?}",
-                        owner_layer_idx, context, plan.selected, plan.initial_runs, error
+                        owner_layer_idx, score_context, plan.selected, plan.initial_runs, error
                     )
                 })?;
         }
@@ -43813,7 +45693,7 @@ impl GpuDecodeStore {
                     )
                 };
                 let output_indices_ptr = if output_runs == 1 {
-                    *resource.d_topk_indices.device_ptr()
+                    selected_output_ptr
                 } else if input_is_a {
                     *indices_b.device_ptr()
                 } else {
@@ -43848,6 +45728,41 @@ impl GpuDecodeStore {
                 }
                 input_runs = output_runs;
                 input_is_a = !input_is_a;
+            }
+        }
+        if let Some(kpool) = registration.glm5_next_kpool {
+            let pool_resource = resource
+                .glm5_next_kpool
+                .as_ref()
+                .ok_or("GLM-5.3 DSA pool resource is absent after selection")?;
+            unsafe {
+                kernels
+                    .glm5_next_kpool_expand_indices
+                    .clone()
+                    .launch(
+                        LaunchConfig::for_num_elems(
+                            u32::try_from(resource.topk_capacity)
+                                .map_err(|_| "GLM-5.3 expanded top-k exceeds u32")?,
+                        ),
+                        (
+                            *resource.d_topk_indices.device_ptr(),
+                            *pool_resource.d_pool_topk_indices.device_ptr(),
+                            i32::try_from(plan.selected)
+                                .map_err(|_| "GLM-5.3 selected pool count exceeds i32")?,
+                            i32::try_from(context - 1)
+                                .map_err(|_| "GLM-5.3 DSA position exceeds i32")?,
+                            i32::try_from(kpool.pool_size)
+                                .map_err(|_| "GLM-5.3 DSA pool size exceeds i32")?,
+                            i32::try_from(resource.topk_capacity)
+                                .map_err(|_| "GLM-5.3 expanded top-k exceeds i32")?,
+                        ),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "GLM-5.3 DSA owner {} pool expansion: {:?}",
+                            owner_layer_idx, error
+                        )
+                    })?;
             }
         }
         Ok(plan)
@@ -43902,6 +45817,16 @@ impl GpuDecodeStore {
         &mut self,
         prompt_tokens: usize,
     ) -> Result<bool, String> {
+        if self.is_glm5_next_runtime() {
+            // Sequential GLM-5.3 prefill executes the decode graph itself, so
+            // evicting decode-resident HCS experts here would only turn every
+            // prompt token into avoidable host streaming.
+            log::info!(
+                "GLM-5.3 sequential prefill preserves decode residency for {} prompt tokens",
+                prompt_tokens
+            );
+            return Ok(false);
+        }
         let runtime_stage_breakdown = std::env::var("KRASIS_RUNTIME_STAGE_BREAKDOWN").is_ok();
         let t_total = std::time::Instant::now();
         let mut boundary_sync_ms = 0.0f64;
@@ -47168,6 +49093,7 @@ impl GpuDecodeStore {
                 .map(|cal| cal.safety_margin_mb as usize)
                 .unwrap_or(crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB),
             prefill_hcs_store_addr: 0,
+            glm5_next_sequential_decode_prefill: graph.glm5_next_decode_workspace.is_some(),
             prompt_hcs_shadow_enabled: false,
             prompt_hcs_counts: Vec::new(),
             prompt_hcs_num_moe_layers: 0,
@@ -54596,7 +56522,7 @@ impl GpuDecodeStore {
                                 layer_idx, ccd
                             ));
                             }
-                            if *ckv_cache_ptr == 0 || *kpe_cache_ptr == 0 {
+                            if *ckv_cache_ptr == 0 || (rope > 0 && *kpe_cache_ptr == 0) {
                                 return Err(format!(
                                 "MLA layer {} has incomplete k4 cache pointers: ckv=0x{:x} kpe=0x{:x}",
                                 layer_idx, *ckv_cache_ptr, *kpe_cache_ptr
@@ -62468,6 +64394,288 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    fn run_glm5_next_ungraphed_step(
+        &mut self,
+        graph: &mut GpuDecodeGraph,
+        _position_ptr: u64,
+        position: usize,
+        step_start: std::time::Instant,
+    ) -> Result<(), String> {
+        use cudarc::driver::LaunchConfig;
+
+        let timing = graph.timing_enabled;
+        let segment_end = if graph.segment_layer_end > 0 {
+            graph.segment_layer_end
+        } else {
+            graph.num_layers
+        };
+        if graph.segment_skip_embedding
+            || graph.segment_skip_final
+            || graph.segment_layer_start != 0
+            || segment_end != graph.num_layers
+        {
+            return Err(format!(
+                "GLM-5.3 ungraphed decode requires a complete local segment; got skip_embedding={} skip_final={} range=[{}, {}) layers={}",
+                graph.segment_skip_embedding,
+                graph.segment_skip_final,
+                graph.segment_layer_start,
+                segment_end,
+                graph.num_layers,
+            ));
+        }
+        let workspace = hyper_connection_decode_workspace_view(graph)?;
+        self.launch_deepseek_v4_hc_replicate_for_graph(graph)?;
+
+        let mut attn_seconds = 0.0f64;
+        let mut ffn_seconds = 0.0f64;
+        for layer_idx in 0..graph.num_layers {
+            let (input_norm_ptr, post_attn_norm_ptr, hc, attention_kind) = {
+                let layer = graph
+                    .layers
+                    .get(layer_idx)
+                    .ok_or_else(|| format!("GLM-5.3 layer {} is absent", layer_idx))?;
+                let hc = layer
+                    .glm5_next_hyper_connection
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("GLM-5.3 layer {} hyper-connection is absent", layer_idx)
+                    })?;
+                let attention_kind = match &layer.attn {
+                    GpuAttnConfig::LinearAttention { kda: Some(_), .. } => 0u8,
+                    GpuAttnConfig::MLA {
+                        qk_rope_dim,
+                        q_lora_rank,
+                        ..
+                    } if *qk_rope_dim == 0 && *q_lora_rank > 0 => 1u8,
+                    _ => {
+                        return Err(format!(
+                            "GLM-5.3 layer {} has an unsupported attention registration",
+                            layer_idx
+                        ))
+                    }
+                };
+                (
+                    layer.input_norm_ptr,
+                    layer.post_attn_norm_ptr,
+                    hc,
+                    attention_kind,
+                )
+            };
+
+            let attention_started = if timing {
+                self.device
+                    .synchronize()
+                    .map_err(|error| format!("GLM-5.3 timing sync: {:?}", error))?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            self.launch_deepseek_v4_hc_prepare_for_graph(
+                graph,
+                workspace.state_ptr,
+                *graph.d_hidden.device_ptr(),
+                hc.attn_fn_wid,
+                hc.attn_base_ptr,
+                hc.attn_scale_ptr,
+                hc.mult,
+                hc.sinkhorn_iters,
+                hc.eps,
+                None,
+                &format!("GLM-5.3 layer {} attention", layer_idx),
+            )?;
+            self.launch_deepseek_v4_rmsnorm_for_graph(
+                graph,
+                *graph.d_hidden.device_ptr(),
+                *graph.d_hidden.device_ptr(),
+                input_norm_ptr,
+                graph.hidden_size,
+                &format!("GLM-5.3 layer {} input", layer_idx),
+            )?;
+            match attention_kind {
+                0 => self.run_glm5_next_kda_attention_decode_for_graph(
+                    graph,
+                    layer_idx,
+                    *graph.d_hidden.device_ptr(),
+                    *graph.d_hidden.device_ptr(),
+                )?,
+                1 => self.run_glm5_next_nope_sparse_mla_decode_for_graph(
+                    graph,
+                    layer_idx,
+                    position,
+                    *graph.d_hidden.device_ptr(),
+                    *graph.d_hidden.device_ptr(),
+                )?,
+                _ => unreachable!(),
+            }
+            self.launch_deepseek_v4_hc_post_for_graph(
+                graph,
+                workspace.next_ptr,
+                *graph.d_hidden.device_ptr(),
+                workspace.state_ptr,
+                hc.mult,
+                &format!("GLM-5.3 layer {} attention", layer_idx),
+            )?;
+            if let Some(start) = attention_started {
+                self.device
+                    .synchronize()
+                    .map_err(|error| format!("GLM-5.3 attention timing sync: {:?}", error))?;
+                attn_seconds += start.elapsed().as_secs_f64();
+            }
+
+            let ffn_started = if timing {
+                self.device
+                    .synchronize()
+                    .map_err(|error| format!("GLM-5.3 timing sync: {:?}", error))?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            self.launch_deepseek_v4_hc_prepare_for_graph(
+                graph,
+                workspace.next_ptr,
+                *graph.d_hidden.device_ptr(),
+                hc.ffn_fn_wid,
+                hc.ffn_base_ptr,
+                hc.ffn_scale_ptr,
+                hc.mult,
+                hc.sinkhorn_iters,
+                hc.eps,
+                None,
+                &format!("GLM-5.3 layer {} FFN", layer_idx),
+            )?;
+            self.launch_deepseek_v4_rmsnorm_for_graph(
+                graph,
+                *graph.d_hidden.device_ptr(),
+                *graph.d_hidden.device_ptr(),
+                post_attn_norm_ptr,
+                graph.hidden_size,
+                &format!("GLM-5.3 layer {} post-attention", layer_idx),
+            )?;
+            let mlp_kind = match &graph.layers[layer_idx].mlp {
+                GpuMlpConfig::Dense { .. } => 0u8,
+                GpuMlpConfig::MoE { .. } => 1u8,
+                GpuMlpConfig::Gemma4MoE { .. } => 2u8,
+                GpuMlpConfig::None => 3u8,
+            };
+            match mlp_kind {
+                0 => self.run_glm5_next_dense_mlp_decode_for_graph(
+                    graph,
+                    layer_idx,
+                    *graph.d_hidden.device_ptr(),
+                    *graph.d_moe_out.device_ptr(),
+                )?,
+                1 => {
+                    self.moe_forward_with_graph(graph, layer_idx)
+                        .map_err(|error| format!("GLM-5.3 MoE layer {}: {}", layer_idx, error))?;
+                }
+                2 => {
+                    return Err(format!(
+                        "GLM-5.3 layer {} cannot use a Gemma4 MoE registration",
+                        layer_idx
+                    ))
+                }
+                _ => {
+                    return Err(format!(
+                        "GLM-5.3 layer {} has no FFN registration",
+                        layer_idx
+                    ))
+                }
+            }
+            self.launch_deepseek_v4_hc_post_for_graph(
+                graph,
+                workspace.state_ptr,
+                *graph.d_moe_out.device_ptr(),
+                workspace.next_ptr,
+                hc.mult,
+                &format!("GLM-5.3 layer {} FFN", layer_idx),
+            )?;
+            if let Some(start) = ffn_started {
+                self.device
+                    .synchronize()
+                    .map_err(|error| format!("GLM-5.3 FFN timing sync: {:?}", error))?;
+                ffn_seconds += start.elapsed().as_secs_f64();
+            }
+        }
+
+        let final_started = if timing {
+            self.device
+                .synchronize()
+                .map_err(|error| format!("GLM-5.3 final timing sync: {:?}", error))?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let kernels = graph.kernels.as_ref().ok_or("kernels not cached")?;
+        unsafe {
+            kernels
+                .glm5_next_hc_mean
+                .clone()
+                .launch(
+                    LaunchConfig::for_num_elems(
+                        u32::try_from(graph.hidden_size)
+                            .map_err(|_| "GLM-5.3 hidden size exceeds u32")?,
+                    ),
+                    (
+                        *graph.d_hidden.device_ptr(),
+                        workspace.state_ptr,
+                        i32::try_from(graph.hidden_size)
+                            .map_err(|_| "GLM-5.3 hidden size exceeds i32")?,
+                        i32::try_from(workspace.hc_mult)
+                            .map_err(|_| "GLM-5.3 HC multiplier exceeds i32")?,
+                    ),
+                )
+                .map_err(|error| format!("GLM-5.3 final HC mean: {:?}", error))?;
+        }
+        self.launch_deepseek_v4_rmsnorm_for_graph(
+            graph,
+            *graph.d_hidden.device_ptr(),
+            *graph.d_hidden.device_ptr(),
+            graph.final_norm_ptr,
+            graph.hidden_size,
+            "GLM-5.3 final",
+        )?;
+        let lm_head = graph
+            .weights
+            .get(graph.lm_head_wid)
+            .ok_or("GLM-5.3 LM head is absent")?;
+        self.gemv_bf16_to_f32_internal(
+            lm_head,
+            *graph.d_hidden.device_ptr(),
+            *graph.d_logits.device_ptr(),
+        )?;
+        self.device
+            .synchronize()
+            .map_err(|error| format!("GLM-5.3 final sync: {:?}", error))?;
+        let final_seconds = final_started
+            .map(|start| start.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        unsafe {
+            let result = cuda_sys::lib().cuMemcpyDtoH_v2(
+                graph.h_logits.as_mut_ptr() as *mut std::ffi::c_void,
+                *graph.d_logits.device_ptr(),
+                graph
+                    .vocab_size
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or("GLM-5.3 logits byte size overflow")?,
+            );
+            if result != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("GLM-5.3 logits D2H: {:?}", result));
+            }
+        }
+        apply_logit_softcap_in_place(&mut graph.h_logits, graph.final_logit_softcap);
+        if timing {
+            let total_seconds = step_start.elapsed().as_secs_f64();
+            graph.t_attn += attn_seconds;
+            graph.t_route += ffn_seconds;
+            graph.t_lm_head += final_seconds;
+            graph.t_norm += (total_seconds - attn_seconds - ffn_seconds - final_seconds).max(0.0);
+            graph.t_total += total_seconds;
+            graph.timing_step_count += 1;
+        }
+        Ok(())
+    }
+
     fn run_deepseek_v4_ungraphed_step(
         &mut self,
         graph: &mut GpuDecodeGraph,
@@ -62862,6 +65070,13 @@ impl GpuDecodeStore {
                     ),
                 }));
             }
+        }
+
+        if graph.glm5_next_decode_workspace.is_some() {
+            let position_ptr = dsa_ungraphed_scalars
+                .map(|(position_ptr, _)| position_ptr)
+                .ok_or("GLM-5.3 decode did not receive graph-addressable scalars")?;
+            return self.run_glm5_next_ungraphed_step(graph, position_ptr, position, t0);
         }
 
         if graph.deepseek_v4_decode_workspace.is_some() {
@@ -65406,7 +67621,7 @@ impl GpuDecodeStore {
                             layer_idx, ccd
                         ));
                     }
-                    if *ckv_cache_ptr == 0 || *kpe_cache_ptr == 0 {
+                    if *ckv_cache_ptr == 0 || (rope > 0 && *kpe_cache_ptr == 0) {
                         return Err(format!(
                             "MLA layer {} has incomplete k4 cache pointers: ckv=0x{:x} kpe=0x{:x}",
                             layer_idx, *ckv_cache_ptr, *kpe_cache_ptr

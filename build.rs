@@ -321,6 +321,7 @@ fn compile_cuda_kernels() {
     let deepseek_v4_hc_header = "src/cuda/deepseek_v4_hc.cuh";
     let deepseek_v4_attention_header = "src/cuda/deepseek_v4_attention.cuh";
     let deepseek_v4_compressor_header = "src/cuda/deepseek_v4_compressor.cuh";
+    let glm5_next_kda_header = "src/cuda/glm5_next_kda.cuh";
     println!("cargo:rerun-if-changed={cu_src}");
     // decode_kernels.cu includes the production entropy decoder directly.
     // Track the included source independently so a codec-only edit can never
@@ -329,6 +330,7 @@ fn compile_cuda_kernels() {
     println!("cargo:rerun-if-changed={deepseek_v4_hc_header}");
     println!("cargo:rerun-if-changed={deepseek_v4_attention_header}");
     println!("cargo:rerun-if-changed={deepseek_v4_compressor_header}");
+    println!("cargo:rerun-if-changed={glm5_next_kda_header}");
     if !std::path::Path::new(cu_src).exists() {
         println!("cargo:warning=decode_kernels.cu not found — GPU decode kernels disabled");
         return;
@@ -351,6 +353,7 @@ fn compile_cuda_kernels() {
             deepseek_v4_hc_header,
             deepseek_v4_attention_header,
             deepseek_v4_compressor_header,
+            glm5_next_kda_header,
         ],
         &[&ptx_path],
     ) {
@@ -402,11 +405,13 @@ fn compile_prefill_kernels() {
     let deepseek_v4_hc_header = "src/cuda/deepseek_v4_hc.cuh";
     let deepseek_v4_attention_header = "src/cuda/deepseek_v4_attention.cuh";
     let deepseek_v4_compressor_header = "src/cuda/deepseek_v4_compressor.cuh";
+    let glm5_next_kda_header = "src/cuda/glm5_next_kda.cuh";
     println!("cargo:rerun-if-changed={cu_src}");
     println!("cargo:rerun-if-changed={shim_header}");
     println!("cargo:rerun-if-changed={deepseek_v4_hc_header}");
     println!("cargo:rerun-if-changed={deepseek_v4_attention_header}");
     println!("cargo:rerun-if-changed={deepseek_v4_compressor_header}");
+    println!("cargo:rerun-if-changed={glm5_next_kda_header}");
     if !std::path::Path::new(cu_src).exists() {
         panic!("required GPU prefill source is missing: {cu_src}");
     }
@@ -424,6 +429,7 @@ fn compile_prefill_kernels() {
             deepseek_v4_hc_header,
             deepseek_v4_attention_header,
             deepseek_v4_compressor_header,
+            glm5_next_kda_header,
         ],
         &[&ptx_path],
     ) {

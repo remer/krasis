@@ -6045,6 +6045,9 @@ pub struct PrefillKernels {
     deepseek_v4_hc_prepare: RawCuFunc,
     deepseek_v4_hc_reduce: RawCuFunc,
     deepseek_v4_hc_post: RawCuFunc,
+    glm5_next_kda_conv_decode: RawCuFunc,
+    glm5_next_kda_recurrent_decode: RawCuFunc,
+    glm5_next_hc_mean: RawCuFunc,
     deepseek_v4_hc_head_prepare: RawCuFunc,
     deepseek_v4_tail_rope_bf16: RawCuFunc,
     deepseek_v4_sparse_scores: RawCuFunc,
@@ -9533,6 +9536,11 @@ pub struct PrefillEngine {
     /// Temporary pointer back to the decode store for chunk-boundary HCS guardrails.
     /// Set only for the lifetime of an active prefill request.
     pub prefill_hcs_store_addr: usize,
+    /// Correctness-first GLM-5.3 fallback. Until the architecture-native
+    /// batched prefill kernels are qualified, encode prompt tokens through the
+    /// already-qualified native decode graph. This is deliberately explicit:
+    /// another hybrid architecture must never fall into this path by shape.
+    pub glm5_next_sequential_decode_prefill: bool,
     /// Request-scoped prompt expert-use histogram for prompt-conditioned HCS diagnostics.
     /// Flat [moe_layer_idx * num_experts_per_layer + expert_id] counts selected routes during exact prefill.
     pub prompt_hcs_shadow_enabled: bool,
@@ -17436,6 +17444,11 @@ impl PrefillEngine {
     pub fn minimum_prefill_entry_free_bytes(&self, prompt_tokens: usize) -> usize {
         let safety_margin_mb = self.safety_margin_mb.max(PREFILL_SAFETY_MARGIN_MB);
         let safety_bytes = safety_margin_mb.saturating_mul(1024 * 1024);
+        if self.glm5_next_sequential_decode_prefill {
+            // The fallback reuses decode-owned workspaces and allocates no
+            // prompt-sized scratch. Keep only the ordinary runtime floor.
+            return safety_bytes;
+        }
         let scratch_tokens = clean_runtime_chunk_tokens(prompt_tokens, 128);
         let scratch_bytes =
             estimate_scratch_vram_for_prompt(&self.config, scratch_tokens, prompt_tokens)
@@ -22834,6 +22847,42 @@ impl PrefillEngine {
     ) -> Result<(), String> {
         self.bind_cuda_context()?;
         self.refresh_trace_config();
+        if self.glm5_next_sequential_decode_prefill {
+            if prompt_tokens == 0 {
+                return Err("Empty token sequence".to_string());
+            }
+            if prompt_tokens > self.kv_max_seq {
+                return Err(format!(
+                    "GLM-5.3 prompt {} exceeds registered capacity {}",
+                    prompt_tokens, self.kv_max_seq
+                ));
+            }
+            let mut free_bytes = 0usize;
+            let mut total_bytes = 0usize;
+            let status =
+                unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free_bytes, &mut total_bytes) };
+            if status != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!(
+                    "query GLM-5.3 sequential-prefill VRAM: {:?}",
+                    status
+                ));
+            }
+            self.last_prepare_post_alloc_free_mb = free_bytes / (1024 * 1024);
+            self.active_prefill_prompt_tokens = prompt_tokens;
+            self.config.prefill_chunk_size = 1;
+            self.last_cold_staging_failure = None;
+            self.prefill_kv_active = false;
+            self.release_prefill_kv_temp();
+            trace_emit_prefill_global_mark(
+                self.trace.as_ref(),
+                "prefill",
+                &format!(
+                    "phase=prepare_ready mode=glm5_next_sequential_decode prompt_tokens={} free_mb={}",
+                    prompt_tokens, self.last_prepare_post_alloc_free_mb,
+                ),
+            );
+            return Ok(());
+        }
         trace_emit_prefill_global_mark(
             self.trace.as_ref(),
             "prefill",
@@ -23834,6 +23883,135 @@ impl PrefillEngine {
         )
     }
 
+    fn run_glm5_next_sequential_prefill_from_state(
+        &mut self,
+        token_ids: &[u32],
+        sequence_start: usize,
+        reset_sequence_state: bool,
+        capture_boundary: Option<usize>,
+        incremental_base: Option<&crate::session_cache::SessionSnapshot>,
+        temperature: f32,
+        suppress_tokens: &[u32],
+    ) -> Result<(PrefillResult, Option<PrefillSequenceBoundaryCapture>), String> {
+        if self.prefill_hcs_store_addr == 0 {
+            return Err(
+                "GLM-5.3 sequential prefill requires a registered decode store".to_string(),
+            );
+        }
+        if self.external_prefill_embeddings_ptr != 0
+            || self.external_mrope_cos_ptr != 0
+            || self.external_mrope_sin_ptr != 0
+        {
+            return Err(
+                "GLM-5.3 sequential prefill does not yet support multimodal inputs".to_string(),
+            );
+        }
+        if token_ids.is_empty() {
+            return Err("Empty token sequence".to_string());
+        }
+        if reset_sequence_state != (sequence_start == 0) {
+            return Err(format!(
+                "GLM-5.3 prefill state contract mismatch: sequence_start={} reset_state={}",
+                sequence_start, reset_sequence_state
+            ));
+        }
+        let total_prompt_tokens = sequence_start
+            .checked_add(token_ids.len())
+            .ok_or_else(|| "GLM-5.3 continuation position overflows".to_string())?;
+        if total_prompt_tokens > self.kv_max_seq {
+            return Err(format!(
+                "GLM-5.3 KV cache exhausted: boundary {} + suffix {} exceeds capacity {}",
+                sequence_start,
+                token_ids.len(),
+                self.kv_max_seq
+            ));
+        }
+        if let Some(boundary) = capture_boundary {
+            if boundary <= sequence_start || boundary >= total_prompt_tokens {
+                return Err(format!(
+                    "GLM-5.3 capture boundary {} must lie strictly inside {}..{}",
+                    boundary, sequence_start, total_prompt_tokens
+                ));
+            }
+        }
+        if let Some(base) = incremental_base {
+            if base.consumed_token_ids.len() != sequence_start {
+                return Err(format!(
+                    "GLM-5.3 incremental base has {} tokens but continuation starts at {}",
+                    base.consumed_token_ids.len(),
+                    sequence_start
+                ));
+            }
+        }
+
+        self.active_prefill_prompt_tokens = total_prompt_tokens;
+        self.reset_prompt_hcs_shadow(token_ids.len());
+        let started = Instant::now();
+        let mut capture = None;
+        if let Some(boundary) = capture_boundary {
+            let prefix_len = boundary - sequence_start;
+            {
+                let store = unsafe {
+                    &mut *(self.prefill_hcs_store_addr as *mut crate::gpu_decode::GpuDecodeStore)
+                };
+                store.glm5_next_sequential_encode_rust(
+                    &token_ids[..prefix_len],
+                    sequence_start,
+                    reset_sequence_state,
+                )?;
+            }
+            capture = Some(self.capture_sequence_boundary_state(boundary, incremental_base)?);
+            {
+                let store = unsafe {
+                    &mut *(self.prefill_hcs_store_addr as *mut crate::gpu_decode::GpuDecodeStore)
+                };
+                store.glm5_next_sequential_encode_rust(
+                    &token_ids[prefix_len..],
+                    boundary,
+                    false,
+                )?;
+            }
+        } else {
+            let store = unsafe {
+                &mut *(self.prefill_hcs_store_addr as *mut crate::gpu_decode::GpuDecodeStore)
+            };
+            store.glm5_next_sequential_encode_rust(
+                token_ids,
+                sequence_start,
+                reset_sequence_state,
+            )?;
+        }
+        let (first_token, logits) = {
+            let store = unsafe {
+                &mut *(self.prefill_hcs_store_addr as *mut crate::gpu_decode::GpuDecodeStore)
+            };
+            let first_token =
+                store.glm5_next_sample_current_logits_rust(temperature, suppress_tokens)?;
+            let logits = store.glm5_next_logits_clone_rust()?;
+            (first_token, logits)
+        };
+        self.h_logits = logits;
+        let prefill_time_ms = started.elapsed().as_secs_f64() * 1000.0;
+        trace_emit_prefill_global_mark(
+            self.trace.as_ref(),
+            "prefill",
+            &format!(
+                "phase=run_complete mode=glm5_next_sequential_decode prompt_tokens={} suffix_tokens={} prefill_ms={:.1}",
+                total_prompt_tokens,
+                token_ids.len(),
+                prefill_time_ms,
+            ),
+        );
+        Ok((
+            PrefillResult {
+                first_token: first_token as u32,
+                prompt_len: total_prompt_tokens,
+                prefill_time_ms,
+            },
+            capture,
+        ))
+    }
+
     fn run_prefill_from_state(
         &mut self,
         token_ids: &[u32],
@@ -23844,6 +24022,17 @@ impl PrefillEngine {
         temperature: f32,
         suppress_tokens: &[u32],
     ) -> Result<(PrefillResult, Option<PrefillSequenceBoundaryCapture>), String> {
+        if self.glm5_next_sequential_decode_prefill {
+            return self.run_glm5_next_sequential_prefill_from_state(
+                token_ids,
+                sequence_start,
+                reset_sequence_state,
+                capture_boundary,
+                incremental_base,
+                temperature,
+                suppress_tokens,
+            );
+        }
         // Bind CUDA context to calling thread (needed for cross-thread use)
         self.bind_cuda_context()?;
         self.refresh_trace_config();
@@ -71645,6 +71834,9 @@ impl PrefillKernels {
                     "deepseek_v4_hc_prepare_kernel",
                     "deepseek_v4_hc_reduce_kernel",
                     "deepseek_v4_hc_post_kernel",
+                    "glm5_next_kda_conv_decode_kernel",
+                    "glm5_next_kda_recurrent_decode_kernel",
+                    "glm5_next_hc_mean_kernel",
                     "deepseek_v4_hc_head_prepare_kernel",
                     "deepseek_v4_tail_rope_bf16_kernel",
                     "deepseek_v4_sparse_scores_kernel",
@@ -72134,6 +72326,9 @@ impl PrefillKernels {
             deepseek_v4_hc_prepare: get("deepseek_v4_hc_prepare_kernel")?,
             deepseek_v4_hc_reduce: get("deepseek_v4_hc_reduce_kernel")?,
             deepseek_v4_hc_post: get("deepseek_v4_hc_post_kernel")?,
+            glm5_next_kda_conv_decode: get("glm5_next_kda_conv_decode_kernel")?,
+            glm5_next_kda_recurrent_decode: get("glm5_next_kda_recurrent_decode_kernel")?,
+            glm5_next_hc_mean: get("glm5_next_hc_mean_kernel")?,
             deepseek_v4_hc_head_prepare: get("deepseek_v4_hc_head_prepare_kernel")?,
             deepseek_v4_tail_rope_bf16: get("deepseek_v4_tail_rope_bf16_kernel")?,
             deepseek_v4_sparse_scores: get("deepseek_v4_sparse_scores_kernel")?,

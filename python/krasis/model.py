@@ -2564,15 +2564,37 @@ class KrasisModel:
         elif layer.layer_type == "moe" and attn is None:
             pass  # MoE-only layer, no attention weights
         elif layer.layer_type == "linear_attention":
-            result["linear_attention"] = {
-                "in_proj_qkvz": attn.in_proj_qkvz,
-                "in_proj_ba": attn.in_proj_ba,
-                "out_proj": attn.out_proj,
-                "conv1d_weight": attn.conv1d_weight,
-                "A_log": attn.A_log,
-                "dt_bias": attn.dt_bias,
-                "norm_weight": attn.norm_weight,
-            }
+            if layer.cfg.is_glm5_next:
+                result["linear_attention"] = {
+                    name: getattr(attn, name)
+                    for name in (
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "q_conv1d",
+                        "k_conv1d",
+                        "v_conv1d",
+                        "f_a_proj",
+                        "f_b_proj",
+                        "b_proj",
+                        "g_a_proj",
+                        "g_b_proj",
+                        "o_norm",
+                        "o_proj",
+                        "A_log",
+                        "dt_bias",
+                    )
+                }
+            else:
+                result["linear_attention"] = {
+                    "in_proj_qkvz": attn.in_proj_qkvz,
+                    "in_proj_ba": attn.in_proj_ba,
+                    "out_proj": attn.out_proj,
+                    "conv1d_weight": attn.conv1d_weight,
+                    "A_log": attn.A_log,
+                    "dt_bias": attn.dt_bias,
+                    "norm_weight": attn.norm_weight,
+                }
         elif layer.cfg.is_deepseek_v4:
             if attn is None or not hasattr(attn, "attention"):
                 raise RuntimeError(
@@ -2595,6 +2617,20 @@ class KrasisModel:
                 attn_d["q_a_layernorm"] = attn.q_a_norm_weight
             else:
                 attn_d["q_proj"] = attn.q_proj
+            if getattr(attn, "dsa_indexer", None) is not None:
+                attn_d["dsa_indexer"] = {
+                    name: getattr(attn.dsa_indexer, name)
+                    for name in (
+                        "wq_b",
+                        "wk",
+                        "weights_proj",
+                        "k_norm_weight",
+                        "k_norm_bias",
+                        "index_kpool_compress_ape",
+                        "index_kpool_compress_gate",
+                    )
+                    if hasattr(attn.dsa_indexer, name)
+                }
             result["attention"] = attn_d
         elif hasattr(layer, 'gqa_weights') and layer.gqa_weights:
             # GQA — weights stored directly on layer (no attention wrapper)
@@ -2613,6 +2649,9 @@ class KrasisModel:
                 if val is not None:
                     attn_d[name] = val
             result["attention"] = attn_d
+
+        if getattr(layer, "hyper_connection", None) is not None:
+            result["hyper_connection"] = dict(layer.hyper_connection.tensors)
 
         # ── MoE weights ──
         if layer.is_moe:
@@ -5216,6 +5255,19 @@ class KrasisModel:
             "k_norm_weight": (1, self.cfg.index_head_dim),
             "k_norm_bias": (1, self.cfg.index_head_dim),
         }
+        if self.cfg.is_glm5_next:
+            tensor_shapes.update(
+                {
+                    "index_kpool_compress_ape": (
+                        self.cfg.index_kpool,
+                        self.cfg.index_head_dim,
+                    ),
+                    "index_kpool_compress_gate": (
+                        self.cfg.index_head_dim,
+                        self.cfg.hidden_size,
+                    ),
+                }
+            )
         staged = 0
         for owner_layer_idx in local_owner_layers:
             owner_attn = self.layers[owner_layer_idx].attention
@@ -5267,6 +5319,12 @@ class KrasisModel:
                 k_norm_weight_wid=weight_ids["k_norm_weight"],
                 k_norm_bias_wid=weight_ids["k_norm_bias"],
                 max_context_tokens=max_context_tokens,
+                index_kpool_compress_ape_wid=weight_ids.get(
+                    "index_kpool_compress_ape"
+                ),
+                index_kpool_compress_gate_wid=weight_ids.get(
+                    "index_kpool_compress_gate"
+                ),
             )
             staged += 1
 
@@ -8968,6 +9026,11 @@ class KrasisModel:
             nonlocal registered
             if tensor is None or not on_store(tensor):
                 return
+            # NoPE MLA (used by GLM-5.3) intentionally has a zero-width
+            # positional cache.  A zero-element CUDA tensor is a shape marker,
+            # not sequence state: it has no allocation for CUDA to inventory.
+            if int(tensor.numel()) == 0:
+                return
             self._register_sequence_state_tensor(
                 store,
                 name=name,
@@ -9172,9 +9235,15 @@ class KrasisModel:
                     max_qkv = max(max_qkv, in_proj_out)
             elif layer.layer_type == "linear_attention":
                 attn = layer.attention
-                # in_proj_qkvz output dim = nk*(dk + dk + hr*dv + hr*dv)
-                qkvz_out = attn.num_k_heads * (2 * attn.k_head_dim + 2 * attn.head_ratio * attn.v_head_dim)
-                max_qkv = max(max_qkv, qkvz_out)
+                if self.cfg.is_glm5_next:
+                    # KDA materializes separate Q/K/V projections before its
+                    # depthwise convolution. The shared scratch must fit the
+                    # concatenated architecture-native projection.
+                    max_qkv = max(max_qkv, attn.conv_dim, attn.qkv_dim)
+                else:
+                    # in_proj_qkvz output dim = nk*(dk + dk + hr*dv + hr*dv)
+                    qkvz_out = attn.num_k_heads * (2 * attn.k_head_dim + 2 * attn.head_ratio * attn.v_head_dim)
+                    max_qkv = max(max_qkv, qkvz_out)
             elif hasattr(layer.attention, 'kv_a_proj'):
                 # MLA: q_absorbed [num_heads * ckv_dim] is the largest buffer
                 ma = layer.attention
@@ -9739,6 +9808,189 @@ class KrasisModel:
                         layer_idx=layer_idx,
                         tensor_names=sorted(v4_hqq_runtime),
                     )
+            elif self.cfg.is_glm5_next:
+                if hqq_active or attn_quant != "bf16":
+                    raise RuntimeError(
+                        "GLM-5.3 native bring-up currently requires BF16 attention. "
+                        "HQQ projection descriptors will be enabled only after the "
+                        "architecture-native BF16 path passes end-to-end quality gates."
+                    )
+                if self._stream_attn_enabled:
+                    raise RuntimeError(
+                        "GLM-5.3 nested KDA/DSA attention streaming is not yet "
+                        "implemented; use resident BF16 attention for validation."
+                    )
+
+                if layer.layer_type == "linear_attention":
+                    projection_names = (
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "f_a_proj",
+                        "f_b_proj",
+                        "b_proj",
+                        "g_a_proj",
+                        "g_b_proj",
+                        "o_proj",
+                    )
+                    projection_wids = {
+                        name: _register_attn_weight(
+                            getattr(attn, name),
+                            layer_idx,
+                            "glm5_next_kda",
+                            name,
+                        )
+                        for name in projection_names
+                    }
+                    attn._init_state(batch_size=1)
+                    attn._rust_conv_weight = attn._conv_weight.contiguous().to(device)
+                    attn._rust_a_log = attn.A_log.float().contiguous().to(device)
+                    attn._rust_dt_bias = attn.dt_bias.float().contiguous().to(device)
+                    attn._rust_o_norm = attn.o_norm.contiguous().to(device)
+                    attn._rust_conv_state = (
+                        attn._conv_state.squeeze(0).contiguous().to(device)
+                    )
+                    attn._rust_recur_state = (
+                        attn._recurrent_state.squeeze(0).float().contiguous().to(device)
+                    )
+                    self._rust_decode_weights.keep(
+                        "glm5_next_kda",
+                        attn._rust_conv_weight,
+                        attn._rust_a_log,
+                        attn._rust_dt_bias,
+                        attn._rust_o_norm,
+                        attn._rust_conv_state,
+                        attn._rust_recur_state,
+                    )
+                    store.register_glm5_next_kda_layer(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm.data_ptr(),
+                        input_norm_size=inp_norm.numel(),
+                        post_attn_norm_ptr=post_norm.data_ptr(),
+                        post_attn_norm_size=post_norm.numel(),
+                        q_proj_wid=projection_wids["q_proj"],
+                        k_proj_wid=projection_wids["k_proj"],
+                        v_proj_wid=projection_wids["v_proj"],
+                        f_a_proj_wid=projection_wids["f_a_proj"],
+                        f_b_proj_wid=projection_wids["f_b_proj"],
+                        b_proj_wid=projection_wids["b_proj"],
+                        g_a_proj_wid=projection_wids["g_a_proj"],
+                        g_b_proj_wid=projection_wids["g_b_proj"],
+                        o_proj_wid=projection_wids["o_proj"],
+                        conv_weight_ptr=attn._rust_conv_weight.data_ptr(),
+                        conv_weight_elems=attn._rust_conv_weight.numel(),
+                        a_log_ptr=attn._rust_a_log.data_ptr(),
+                        a_log_elems=attn._rust_a_log.numel(),
+                        dt_bias_ptr=attn._rust_dt_bias.data_ptr(),
+                        dt_bias_elems=attn._rust_dt_bias.numel(),
+                        o_norm_ptr=attn._rust_o_norm.data_ptr(),
+                        o_norm_elems=attn._rust_o_norm.numel(),
+                        conv_state_ptr=attn._rust_conv_state.data_ptr(),
+                        conv_state_elems=attn._rust_conv_state.numel(),
+                        recur_state_ptr=attn._rust_recur_state.data_ptr(),
+                        recur_state_elems=attn._rust_recur_state.numel(),
+                        num_heads=attn.num_heads,
+                        head_dim=attn.head_dim,
+                        kernel_dim=attn.kernel_dim,
+                        query_scale=attn.scale,
+                        gate_lower_bound=attn.gate_lower_bound,
+                        norm_eps=self.cfg.rms_norm_eps,
+                    )
+                    self._la_wids[layer_idx] = tuple(
+                        projection_wids[name] for name in projection_names
+                    )
+                else:
+                    if not hasattr(attn, "kv_a_proj"):
+                        raise RuntimeError(
+                            f"GLM-5.3 layer {layer_idx} is neither KDA nor sparse MLA"
+                        )
+                    qa_wid = _register_attn_weight(
+                        attn.q_a_proj, layer_idx, "glm5_next_mla", "q_a_proj"
+                    )
+                    qb_wid = _register_attn_weight(
+                        attn.q_b_proj, layer_idx, "glm5_next_mla", "q_b_proj"
+                    )
+                    kva_wid = _register_attn_weight(
+                        attn.kv_a_proj,
+                        layer_idx,
+                        "glm5_next_mla",
+                        "kv_a_proj_with_mqa",
+                    )
+                    o_wid = _register_attn_weight(
+                        attn.o_proj, layer_idx, "glm5_next_mla", "o_proj"
+                    )
+                    attn._rust_q_a_norm = (
+                        attn.q_a_norm_weight.float().contiguous().to(device)
+                    )
+                    attn._rust_kv_a_norm = (
+                        attn.kv_a_norm_weight.float().contiguous().to(device)
+                    )
+                    attn._rust_w_kc = attn.w_kc.contiguous().to(device)
+                    attn._rust_w_vc = attn.w_vc.contiguous().to(device)
+                    self._rust_decode_weights.keep(
+                        "glm5_next_mla",
+                        attn._rust_q_a_norm,
+                        attn._rust_kv_a_norm,
+                        attn._rust_w_kc,
+                        attn._rust_w_vc,
+                    )
+                    cache, mla_offset = self._kv_cache_slot_for_layer(layer_idx)
+                    ckv_layer = cache.ckv_cache[mla_offset]
+                    kpe_layer = cache.kpe_cache[mla_offset]
+                    store.register_mla_layer(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm.data_ptr(),
+                        input_norm_size=inp_norm.numel(),
+                        post_attn_norm_ptr=post_norm.data_ptr(),
+                        post_attn_norm_size=post_norm.numel(),
+                        kv_a_proj_wid=kva_wid,
+                        o_proj_wid=o_wid,
+                        kv_a_norm_ptr=attn._rust_kv_a_norm.data_ptr(),
+                        w_kc_ptr=attn._rust_w_kc.data_ptr(),
+                        w_vc_ptr=attn._rust_w_vc.data_ptr(),
+                        num_heads=attn.num_heads,
+                        kv_lora_rank=attn.kv_lora_rank,
+                        qk_nope_dim=attn.qk_nope_dim,
+                        qk_rope_dim=attn.qk_rope_dim,
+                        v_head_dim=attn.v_head_dim,
+                        sm_scale=attn.sm_scale,
+                        rope_interleave=False,
+                        ckv_cache_ptr=ckv_layer.data_ptr(),
+                        kpe_cache_ptr=kpe_layer.data_ptr(),
+                        q_a_proj_wid=qa_wid,
+                        q_b_proj_wid=qb_wid,
+                        q_a_norm_ptr=attn._rust_q_a_norm.data_ptr(),
+                        q_proj_wid=None,
+                        q_lora_rank=attn.q_lora_rank,
+                        ckv_cache_dim=attn.ckv_dim,
+                    )
+                    owner_layer_idx = attn.dsa_indexer_owner_layer
+                    if owner_layer_idx is None:
+                        raise RuntimeError(
+                            f"GLM-5.3 sparse layer {layer_idx} has no DSA owner"
+                        )
+                    store.register_dsa_indexer_layer(
+                        layer_idx=layer_idx,
+                        owner_layer_idx=owner_layer_idx,
+                        owner_weights_present=attn.dsa_indexer is not None,
+                        index_topk=self.cfg.index_topk,
+                        index_head_dim=self.cfg.index_head_dim,
+                        index_n_heads=self.cfg.index_n_heads,
+                        qk_rope_head_dim=self.cfg.qk_rope_head_dim,
+                        index_topk_freq=self.cfg.index_topk_freq,
+                        index_skip_topk_offset=self.cfg.index_skip_topk_offset,
+                        q_lora_rank=self.cfg.q_lora_rank,
+                        hidden_size=self.cfg.hidden_size,
+                        rope_interleave=False,
+                    )
+                    store.configure_glm5_next_dsa_kpool_layer(
+                        layer_idx=layer_idx,
+                        index_kpool=self.cfg.index_kpool,
+                        index_kpool_compress=self.cfg.index_kpool_compress,
+                        index_kpool_always_select_tail=(
+                            self.cfg.index_kpool_always_select_tail
+                        ),
+                    )
             elif hqq_active:
                 # HQQ registration below owns attention projection residency.
                 # Do not route HQQ tensors through the normal BF16/Marlin
@@ -10170,6 +10422,50 @@ class KrasisModel:
                     )
                     rope_set = True
 
+            if self.cfg.is_glm5_next:
+                hc = layer.hyper_connection.tensors
+                attn_fn = hc["hc_attn_fn"].contiguous().to(device)
+                ffn_fn = hc["hc_ffn_fn"].contiguous().to(device)
+                attn_base = hc["hc_attn_base"].contiguous().to(device)
+                attn_scale = hc["hc_attn_scale"].contiguous().to(device)
+                ffn_base = hc["hc_ffn_base"].contiguous().to(device)
+                ffn_scale = hc["hc_ffn_scale"].contiguous().to(device)
+                self._rust_decode_weights.keep(
+                    "glm5_next_hyper_connection",
+                    attn_fn,
+                    ffn_fn,
+                    attn_base,
+                    attn_scale,
+                    ffn_base,
+                    ffn_scale,
+                )
+                store.register_glm5_next_hyper_connection(
+                    layer_idx=layer_idx,
+                    attn_fn_wid=store.register_weight(
+                        attn_fn.data_ptr(),
+                        attn_fn.shape[0],
+                        attn_fn.shape[1],
+                        _weight_dtype_code(attn_fn),
+                    ),
+                    attn_base_ptr=attn_base.data_ptr(),
+                    attn_base_elems=attn_base.numel(),
+                    attn_scale_ptr=attn_scale.data_ptr(),
+                    attn_scale_elems=attn_scale.numel(),
+                    ffn_fn_wid=store.register_weight(
+                        ffn_fn.data_ptr(),
+                        ffn_fn.shape[0],
+                        ffn_fn.shape[1],
+                        _weight_dtype_code(ffn_fn),
+                    ),
+                    ffn_base_ptr=ffn_base.data_ptr(),
+                    ffn_base_elems=ffn_base.numel(),
+                    ffn_scale_ptr=ffn_scale.data_ptr(),
+                    ffn_scale_elems=ffn_scale.numel(),
+                    mult=self.cfg.hc_mult,
+                    sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
+                    eps=self.cfg.hc_eps,
+                )
+
             # Register MLP type
             if layer.is_moe and self.cfg.gemma4_text and layer.dense_mlp is not None:
                 gp = self._dense_mlp_tensor(layer.dense_mlp["gate_proj"])
@@ -10505,7 +10801,7 @@ class KrasisModel:
             )
 
         if self.cfg.is_dsa:
-            if not hqq_active:
+            if not hqq_active and not self.cfg.is_glm5_next:
                 raise RuntimeError(
                     "Native DSA execution requires HQQ attention registration"
                 )
@@ -10523,6 +10819,28 @@ class KrasisModel:
                 staged_dsa,
                 len(self.layers),
             )
+            if self.cfg.is_glm5_next:
+                logical_max_seq = max(
+                    cache.max_context_tokens
+                    for cache in self.kv_caches
+                    if cache is not None
+                )
+                registered_glm_layers = store.finalize_glm5_next_layers(
+                    logical_max_seq,
+                    float(self.cfg.swiglu_limit),
+                )
+                if registered_glm_layers != self.cfg.num_hidden_layers:
+                    raise RuntimeError(
+                        "GLM-5.3 runtime registration count mismatch: "
+                        f"{registered_glm_layers}/{self.cfg.num_hidden_layers}"
+                    )
+                logger.info(
+                    "GLM-5.3 runtime registration complete: %d/%d layers, "
+                    "logical_max_seq=%d",
+                    registered_glm_layers,
+                    self.cfg.num_hidden_layers,
+                    logical_max_seq,
+                )
 
         self._gpu_decode_store = store
 
@@ -12069,6 +12387,31 @@ class KrasisModel:
                 inp_norm = layer.input_norm_weight
                 post_norm = layer.post_attn_norm_weight
                 conv_w = attn._rust_conv_weight
+
+                if self.cfg.is_glm5_next:
+                    # KDA owns a BF16 convolution state and an FP32 recurrent
+                    # matrix. Preserve both fixed addresses and update the
+                    # already-validated native registration in place; calling
+                    # register_la_layer here would erase the KDA descriptor.
+                    new_conv = attn._conv_state.squeeze(0).contiguous()
+                    new_recur = (
+                        attn._recurrent_state.squeeze(0).float().contiguous()
+                    )
+                    if (
+                        getattr(attn, "_rust_conv_state", None) is not None
+                        and attn._rust_conv_state.shape == new_conv.shape
+                    ):
+                        attn._rust_conv_state.copy_(new_conv)
+                        attn._rust_recur_state.copy_(new_recur)
+                    else:
+                        attn._rust_conv_state = new_conv
+                        attn._rust_recur_state = new_recur
+                    store.update_la_state_ptrs(
+                        layer_idx,
+                        attn._rust_conv_state.data_ptr(),
+                        attn._rust_recur_state.data_ptr(),
+                    )
+                    continue
 
                 # Prefill may have updated conv_state and recurrent_state (BF16) -- convert to FP32 for Rust.
                 # IMPORTANT: copy INTO existing buffers to preserve fixed GPU addresses for CUDA graph replay.

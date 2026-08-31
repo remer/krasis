@@ -20,6 +20,7 @@
 #include "deepseek_v4_attention.cuh"
 #undef KRASIS_DEEPSEEK_V4_PREFILL_ONLY_KERNELS
 #include "deepseek_v4_compressor.cuh"
+#include "glm5_next_kda.cuh"
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
