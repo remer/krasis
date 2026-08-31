@@ -11,6 +11,32 @@
 {%- if not drop_thinking is defined -%}
   {%- set drop_thinking = false -%}
 {%- endif -%}
+{%- macro render_content(content) -%}
+  {%- if content is string -%}
+    {%- if '<｜deepseek_image｜>' in content -%}
+      {{- raise_exception('DeepSeek-V4 image placeholders must come from image content parts') -}}
+    {%- endif -%}
+    {{- content -}}
+  {%- elif content -%}
+    {%- set rendered = namespace(first=true) -%}
+    {%- for part in content -%}
+      {%- if not rendered.first -%}
+        {{- '\n\n' -}}
+      {%- endif -%}
+      {%- if part['type'] == 'text' -%}
+        {%- if '<｜deepseek_image｜>' in (part['text'] or '') -%}
+          {{- raise_exception('DeepSeek-V4 image placeholders must come from image content parts') -}}
+        {%- endif -%}
+        {{- part['text'] or '' -}}
+      {%- elif part['type'] == 'image' -%}
+        {{- '<｜deepseek_image｜>' -}}
+      {%- else -%}
+        {{- raise_exception('unsupported DeepSeek-V4 content part type: ' + (part['type'] or 'missing')) -}}
+      {%- endif -%}
+      {%- set rendered.first = false -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endmacro -%}
 {%- set dsml_token = '｜DSML｜' -%}
 {%- set thinking_start_token = '<think>' -%}
 {%- set thinking_end_token = '</think>' -%}
@@ -19,11 +45,12 @@
 {%- set ns = namespace(system_prompt='', is_first_sp=true, has_tool_calls=false) -%}
 {%- for message in messages -%}
   {%- if message['role'] == 'system' -%}
+    {%- set content = render_content(message['content']) -%}
     {%- if ns.is_first_sp -%}
-      {%- set ns.system_prompt = ns.system_prompt + (message['content'] or '') -%}
+      {%- set ns.system_prompt = ns.system_prompt + content -%}
       {%- set ns.is_first_sp = false -%}
     {%- else -%}
-      {%- set ns.system_prompt = ns.system_prompt + '\n\n' + (message['content'] or '') -%}
+      {%- set ns.system_prompt = ns.system_prompt + '\n\n' + content -%}
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
@@ -62,7 +89,7 @@
       {{- '<｜User｜>' -}}
       {%- set state.in_user = true -%}
     {%- endif -%}
-    {{- message['content'] or '' -}}
+    {{- render_content(message['content']) -}}
   {%- elif message['role'] == 'tool' -%}
     {%- if state.in_user -%}
       {{- '\n\n' -}}
@@ -70,7 +97,7 @@
       {{- '<｜User｜>' -}}
       {%- set state.in_user = true -%}
     {%- endif -%}
-    {{- '<tool_result>' + (message['content'] or '') + '</tool_result>' -}}
+    {{- '<tool_result>' + render_content(message['content']) + '</tool_result>' -}}
   {%- elif message['role'] == 'assistant' -%}
     {%- set state.in_user = false -%}
     {{- '<｜Assistant｜>' -}}
@@ -86,7 +113,7 @@
       {{- thinking_end_token -}}
     {%- endif -%}
     {%- if message['content'] is defined and message['content'] -%}
-      {{- message['content'] -}}
+      {{- render_content(message['content']) -}}
     {%- endif -%}
     {%- if message['tool_calls'] -%}
       {{- '\n\n<' + dsml_token + 'tool_calls>\n' -}}

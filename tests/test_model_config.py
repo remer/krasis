@@ -129,6 +129,25 @@ def _deepseek_v4_config() -> dict:
     }
 
 
+def _deepseek_v4_vision_config() -> dict:
+    raw = _deepseek_v4_config()
+    raw.update(
+        {
+            "vision_n_layers": 32,
+            "vision_dim": 1024,
+            "vision_n_heads": 16,
+            "vision_inter_dim": 2816,
+            "vision_patch_size": 14,
+            "vision_rope_theta": 10000.0,
+            "vision_downsample_ratio": 3,
+            "vision_max_n_token": 384,
+            "vision_min_pixels": 147456,
+            "vision_max_wh_ratio": 8,
+        }
+    )
+    return raw
+
+
 class ModelConfigContractTests(unittest.TestCase):
     def test_qwen3_next_preserves_distinct_linear_key_value_geometry(self) -> None:
         raw = {
@@ -325,6 +344,25 @@ class ModelConfigContractTests(unittest.TestCase):
         self.assertEqual(cfg.tensor_name("embed.weight"), "embed.weight")
         self.assertEqual(cfg.layer_tensor_prefix(2), "layers.2")
 
+    def test_deepseek_v4_vision_architecture_contract(self) -> None:
+        cfg = ModelConfig.from_model_path(
+            _write_config(self, _deepseek_v4_vision_config())
+        )
+        self.assertTrue(cfg.is_deepseek_v4_vision)
+        self.assertEqual(cfg.vision_n_layers, 32)
+        self.assertEqual(cfg.vision_dim, 1024)
+        self.assertEqual(cfg.vision_n_heads, 16)
+        self.assertEqual(cfg.vision_inter_dim, 2816)
+        self.assertEqual(cfg.vision_patch_size, 14)
+        self.assertEqual(cfg.vision_downsample_ratio, 3)
+        self.assertEqual(cfg.vision_max_n_token, 384)
+        self.assertEqual(cfg.vision_max_wh_ratio, 8.0)
+
+        raw = _deepseek_v4_vision_config()
+        del raw["vision_inter_dim"]
+        with self.assertRaisesRegex(ValueError, r"positive vision_inter_dim"):
+            ModelConfig.from_model_path(_write_config(self, raw))
+
     def test_deepseek_v4_kv_budget_matches_raw_compressed_and_state_layout(self) -> None:
         cfg = self._compact_deepseek_v4_config()
         cache = PagedKVCache.__new__(PagedKVCache)
@@ -431,6 +469,38 @@ class ModelConfigContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"contiguous from zero"):
             loader._validate_deepseek_v4_checkpoint_inventory()
 
+    def test_deepseek_v4_vision_checkpoint_inventory_is_explicit(self) -> None:
+        cfg = ModelConfig.from_model_path(
+            _write_config(self, _deepseek_v4_vision_config())
+        )
+        loader = WeightLoader.__new__(WeightLoader)
+        loader.cfg = cfg
+        loader._weight_map = {
+            **{f"layers.{idx}.attn.weight": "fixture" for idx in range(4)},
+            "embed.weight": "fixture",
+            "norm.weight": "fixture",
+            "head.weight": "fixture",
+            "hc_head_base": "fixture",
+            "hc_head_fn": "fixture",
+            "hc_head_scale": "fixture",
+            "vision.patch_embed.proj.weight": "fixture",
+            "vision.blocks.0.attn.wqkv.weight": "fixture",
+            "vision.norm.weight": "fixture",
+            "aligner.w1.weight": "fixture",
+            "aligner.w1.bias": "fixture",
+            "aligner.w2.weight": "fixture",
+            "aligner.w2.bias": "fixture",
+            "image_start": "fixture",
+            "image_pad": "fixture",
+            "image_newline": "fixture",
+            "image_end": "fixture",
+        }
+        loader._validate_deepseek_v4_checkpoint_inventory()
+
+        loader._weight_map["visual_alias.weight"] = "fixture"
+        with self.assertRaisesRegex(ValueError, r"unexpected tensor namespace"):
+            loader._validate_deepseek_v4_checkpoint_inventory()
+
     def test_deepseek_v4_layer_contract_covers_all_compression_modes(self) -> None:
         cfg = self._compact_deepseek_v4_config()
         for layer_idx in (0, 1, 2):
@@ -443,12 +513,15 @@ class ModelConfigContractTests(unittest.TestCase):
                 )
                 self.assertEqual(native.compress_ratio, cfg.compress_ratios[layer_idx])
 
-    def test_deepseek_v4_layer_extraction_preserves_hash_and_nested_weights(self) -> None:
+    def test_deepseek_v4_layer_extraction_preserves_router_and_nested_weights(self) -> None:
         cfg = self._compact_deepseek_v4_config()
         attention, hyper_connection = self._deepseek_v4_layer_tensors(cfg, 0)
         hash_table = torch.arange(
             cfg.vocab_size * cfg.num_experts_per_tok, dtype=torch.int64
         ).reshape(cfg.vocab_size, cfg.num_experts_per_tok)
+        vision_bias = torch.linspace(
+            -0.5, 0.5, cfg.n_routed_experts, dtype=torch.float32
+        )
         weights = {
             "norms": {
                 "input_layernorm": torch.empty(cfg.hidden_size, dtype=torch.bfloat16),
@@ -463,6 +536,7 @@ class ModelConfigContractTests(unittest.TestCase):
                     cfg.n_routed_experts, cfg.hidden_size, dtype=torch.bfloat16
                 ),
                 "tid2eid": hash_table,
+                "vision_bias": vision_bias,
             },
             "is_moe": True,
             "layer_type": "full_attention",
@@ -475,6 +549,7 @@ class ModelConfigContractTests(unittest.TestCase):
             hyper_connection["hc_attn_fn"],
         )
         self.assertIs(extracted["gate"]["tid2eid"], hash_table)
+        self.assertIs(extracted["gate"]["vision_bias"], vision_bias)
 
     def test_dsa_topk_candidate_capacity_matches_native_hierarchy(self) -> None:
         self.assertEqual(_dsa_topk_candidate_capacity(1537, 2048), 0)

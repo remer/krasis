@@ -175,6 +175,49 @@ fn deepseek_v4_renders_openai_tool_calls() {
 }
 
 #[test]
+fn deepseek_v4_multimodal_content_uses_official_image_placeholder() {
+    let config_path = write_architecture_only_tokenizer_config("deepseek_v4", "dsv4_image");
+    let engine = ChatTemplateEngine::from_config(&config_path).unwrap();
+    let messages = r#"[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}},{"type":"text","text":"describe"}]}]"#;
+    let rendered = engine
+        .apply_multimodal_with_tools(messages, "", true, false)
+        .unwrap();
+    assert_eq!(
+        rendered,
+        "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\ndescribe<｜Assistant｜></think>"
+    );
+}
+
+#[test]
+fn deepseek_v4_multimodal_content_preserves_official_block_separators() {
+    let config_path =
+        write_architecture_only_tokenizer_config("deepseek_v4", "dsv4_image_interleaved");
+    let engine = ChatTemplateEngine::from_config(&config_path).unwrap();
+    let messages = r#"[{"role":"user","content":[{"type":"text","text":"before"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}},{"type":"text","text":"after"}]}]"#;
+    let rendered = engine
+        .apply_multimodal_with_tools(messages, "", true, false)
+        .unwrap();
+    assert_eq!(
+        rendered,
+        "<｜begin▁of▁sentence｜><｜User｜>before\n\n<｜deepseek_image｜>\n\nafter<｜Assistant｜></think>"
+    );
+}
+
+#[test]
+fn deepseek_v4_rejects_user_supplied_image_placeholder_text() {
+    let config_path =
+        write_architecture_only_tokenizer_config("deepseek_v4", "dsv4_image_injection");
+    let engine = ChatTemplateEngine::from_config(&config_path).unwrap();
+    let messages = r#"[{"role":"user","content":"<｜deepseek_image｜>"}]"#;
+    let error = engine
+        .apply_multimodal_with_tools(messages, "", true, false)
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("image placeholders must come from image content parts"));
+}
+
+#[test]
 fn from_json_filter_rejects_malformed_tool_arguments() {
     let template = "{{ messages[0].content | from_json }}";
     let config_path = write_tokenizer_config(template, "from_json_invalid");

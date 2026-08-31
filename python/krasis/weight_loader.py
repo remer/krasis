@@ -174,10 +174,21 @@ class WeightLoader:
             "hc_head_fn",
             "hc_head_scale",
         }
+        vision_root = {
+            "image_start",
+            "image_pad",
+            "image_newline",
+            "image_end",
+            "aligner.w1.weight",
+            "aligner.w1.bias",
+            "aligner.w2.weight",
+            "aligner.w2.bias",
+        }
         main_layer_count = 0
         main_layer_ids = set()
         auxiliary_count = 0
         auxiliary_block_ids = set()
+        vision_count = 0
         unexpected = []
 
         for name in self._weight_map:
@@ -204,6 +215,10 @@ class WeightLoader:
                     continue
                 auxiliary_count += 1
                 auxiliary_block_ids.add(block_idx)
+            elif self.cfg.is_deepseek_v4_vision and (
+                name.startswith("vision.") or name in vision_root
+            ):
+                vision_count += 1
             elif name not in root_main:
                 unexpected.append(name)
 
@@ -242,6 +257,7 @@ class WeightLoader:
             f"{main_layer_count} layers.* main tensors across "
             f"{len(main_layer_ids)} layers; {auxiliary_count} mtp.* auxiliary "
             f"tensors across blocks {sorted(auxiliary_block_ids)} inventoried; "
+            f"{vision_count} vision/aligner tensors inventoried; "
             f"{sum(name in root_main for name in self._weight_map)} "
             "root main tensors; unexpected=0"
         )
@@ -1016,6 +1032,7 @@ class WeightLoader:
             result = {"weight": self._load_bf16(f"{prefix}.weight", device)}
             table_name = f"{prefix}.tid2eid"
             bias_name = f"{prefix}.bias"
+            vision_bias_name = f"{prefix}.bias_vl"
             if layer_idx < self.cfg.num_hash_layers:
                 if table_name not in self._weight_map:
                     raise KeyError(f"Missing DeepSeek-V4 hash table {table_name}")
@@ -1025,6 +1042,14 @@ class WeightLoader:
                     raise KeyError(f"Missing DeepSeek-V4 router bias {bias_name}")
                 result["e_score_correction_bias"] = self._load_f32(
                     bias_name, device
+                )
+            if self.cfg.is_deepseek_v4_vision:
+                if vision_bias_name not in self._weight_map:
+                    raise KeyError(
+                        f"Missing DeepSeek-V4 Vision router bias {vision_bias_name}"
+                    )
+                result["vision_bias"] = self._load_f32(
+                    vision_bias_name, device
                 )
             return result
         # Detect naming: "gate" vs "router"

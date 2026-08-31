@@ -2709,6 +2709,7 @@ struct MultimodalPrefillInputs {
     mrope_half_dim: usize,
     rope_delta: i32,
     vision_block_ids_ptr: u64,
+    requires_single_chunk: bool,
     image_count: usize,
     image_tokens: usize,
 }
@@ -3152,6 +3153,12 @@ fn handle_chat_completion(stream: &mut TcpStream, body: &str, state: &mut Server
                     .map_err(|e| {
                         format!("image prefill vision_block_ids_ptr extract failed: {}", e)
                     })?;
+                let requires_single_chunk: bool = match mm.get_item("requires_single_chunk") {
+                    Ok(value) => value.extract().map_err(|e| {
+                        format!("image prefill requires_single_chunk extract failed: {}", e)
+                    })?,
+                    Err(_) => false,
+                };
                 let image_count: usize = mm
                     .get_item("image_count")
                     .map_err(|e| format!("image prefill image_count read failed: {}", e))?
@@ -3170,6 +3177,7 @@ fn handle_chat_completion(stream: &mut TcpStream, body: &str, state: &mut Server
                     mrope_half_dim,
                     rope_delta,
                     vision_block_ids_ptr,
+                    requires_single_chunk,
                     image_count,
                     image_tokens,
                 })
@@ -3796,6 +3804,22 @@ fn handle_chat_completion(stream: &mut TcpStream, body: &str, state: &mut Server
         let kv_max_seq = engine.kv_max_seq;
         let kv_overflow = token_ids.len() > kv_max_seq;
 
+        // Scratch geometry depends on DeepSeek-V4 Vision's widened image
+        // visibility window. Publish the request-scoped pointers before the
+        // dynamic prefill allocation so text-only requests keep the ordinary
+        // sparse-window footprint and image requests reserve the exact bound.
+        if let Some(mm) = multimodal_inputs.as_ref() {
+            engine.set_external_prefill_inputs(
+                mm.inputs_embeds_ptr,
+                mm.mrope_cos_ptr,
+                mm.mrope_sin_ptr,
+                mm.mrope_half_dim,
+                mm.vision_block_ids_ptr,
+            );
+        } else {
+            engine.clear_external_prefill_inputs();
+        }
+
         let _has_hqq_runtime_slots = {
             let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
             match prepare_store_for_rust_prefill(store, engine, token_ids.len()) {
@@ -3831,6 +3855,20 @@ fn handle_chat_completion(stream: &mut TcpStream, body: &str, state: &mut Server
         let mut retry_attempt = 0usize;
         let result = loop {
             engine.set_prefill_runtime_chunk_cap(retry_cap);
+            // A measured cold-staging retry clears external pointers while it
+            // releases scratch. Re-publish them before every allocation pass
+            // so a Vision retry cannot accidentally use text-only geometry.
+            if let Some(mm) = multimodal_inputs.as_ref() {
+                engine.set_external_prefill_inputs(
+                    mm.inputs_embeds_ptr,
+                    mm.mrope_cos_ptr,
+                    mm.mrope_sin_ptr,
+                    mm.mrope_half_dim,
+                    mm.vision_block_ids_ptr,
+                );
+            } else {
+                engine.clear_external_prefill_inputs();
+            }
 
             // Dynamically allocate scratch sized for this prompt.
             // Scratch contains prompt-wide state for several attention
@@ -3876,6 +3914,25 @@ fn handle_chat_completion(stream: &mut TcpStream, body: &str, state: &mut Server
                     &format!(r#"{{"error":"Scratch alloc failed: {}"}}"#, e),
                 );
                 return;
+            }
+            if multimodal_inputs
+                .as_ref()
+                .is_some_and(|mm| mm.requires_single_chunk)
+            {
+                let chunk_capacity = if engine.config.prefill_chunk_size > 0 {
+                    engine
+                        .config
+                        .prefill_chunk_size
+                        .min(engine.scratch.max_tokens)
+                } else {
+                    engine.scratch.max_tokens
+                };
+                if chunk_capacity < token_ids.len() {
+                    break Err(format!(
+                        "VRAM is too constrained for this image request. DeepSeek-V4 Vision requires its {}-token image prompt to prefill in one chunk, but the measured-safe capacity is {} tokens",
+                        token_ids.len(), chunk_capacity
+                    ));
+                }
             }
             cache_prefill_stage_required = match engine.stage_exact_snapshot_cost_estimate(1) {
                 Ok(bytes) => bytes > 0,
@@ -4026,18 +4083,6 @@ fn handle_chat_completion(stream: &mut TcpStream, body: &str, state: &mut Server
                 let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
                 store.suppress_tokens_clone()
             };
-            if let Some(mm) = multimodal_inputs.as_ref() {
-                engine.set_external_prefill_inputs(
-                    mm.inputs_embeds_ptr,
-                    mm.mrope_cos_ptr,
-                    mm.mrope_sin_ptr,
-                    mm.mrope_half_dim,
-                    mm.vision_block_ids_ptr,
-                );
-            } else {
-                engine.clear_external_prefill_inputs();
-            }
-
             let attempt_result = match match (cache_sequence_start, capture_boundary) {
                 (sequence_start, Some(boundary)) if sequence_start > 0 => engine
                     .run_prefill_continuation_capturing_boundary(

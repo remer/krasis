@@ -8252,6 +8252,10 @@ struct MoeLayerData {
     gate_bias_ptr: u64,
     /// E_score_correction ptr (0 if none), FP32 on GPU.
     e_score_corr_ptr: u64,
+    /// DeepSeek-V4 Vision image-token selection bias [num_experts], FP32 on GPU.
+    vision_bias_ptr: u64,
+    /// Text vocabulary boundary; IDs at or above this are Vision sentinel/patch IDs.
+    model_vocab_size: usize,
     /// DeepSeek-V4 token-id to expert-id table [vocab, topk] in I32, or 0.
     hash_table_ptr: u64,
     hash_vocab_size: usize,
@@ -17009,6 +17013,7 @@ struct GpuDecodeGraph {
     weights: Vec<GpuWeight>,
     layers: Vec<GpuDecodeLayer>,
     deepseek_v4_head: Option<DeepseekV4HeadRegistration>,
+    deepseek_v4_vision_max_tokens: usize,
     deepseek_v4_decode_policy: DeepseekV4DecodePolicy,
 
     embedding_ptr: u64,
@@ -28693,6 +28698,7 @@ impl GpuDecodeStore {
             weights: Vec::with_capacity(num_layers * 8),
             layers: Vec::with_capacity(num_layers),
             deepseek_v4_head: None,
+            deepseek_v4_vision_max_tokens: 0,
             deepseek_v4_decode_policy: self.deepseek_v4_decode_policy,
             embedding_ptr: 0,
             embedding_scale: 1.0,
@@ -32114,6 +32120,74 @@ impl GpuDecodeStore {
         }
         moe.hash_table_ptr = table_ptr as u64;
         moe.hash_vocab_size = vocab_size;
+        if moe.model_vocab_size == 0 {
+            moe.model_vocab_size = vocab_size;
+        } else if moe.model_vocab_size != vocab_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "DeepSeek-V4 layer {} vocabulary mismatch: hash={} model={}",
+                layer_idx, vocab_size, moe.model_vocab_size
+            )));
+        }
+        Ok(())
+    }
+
+    /// Register DeepSeek-V4 Vision's image-token expert-selection bias.
+    fn set_moe_deepseek_v4_vision_bias(
+        &mut self,
+        layer_idx: usize,
+        bias_ptr: usize,
+        bias_elems: usize,
+        vocab_size: usize,
+        max_image_tokens: usize,
+    ) -> PyResult<()> {
+        let graph = self
+            .graph
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        if max_image_tokens == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "DeepSeek-V4 Vision requires max_image_tokens > 0",
+            ));
+        }
+        if graph.deepseek_v4_vision_max_tokens != 0
+            && graph.deepseek_v4_vision_max_tokens != max_image_tokens
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "DeepSeek-V4 Vision max image tokens changed: {} != {}",
+                max_image_tokens, graph.deepseek_v4_vision_max_tokens
+            )));
+        }
+        graph.deepseek_v4_vision_max_tokens = max_image_tokens;
+        let moe = graph
+            .moe_layers
+            .get_mut(layer_idx)
+            .and_then(|entry| entry.as_mut())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "MoE layer {} not registered",
+                    layer_idx
+                ))
+            })?;
+        if moe.scoring_func != 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "DeepSeek-V4 Vision bias requires sqrtsoftplus routing; layer {} uses {}",
+                layer_idx, moe.scoring_func
+            )));
+        }
+        if bias_ptr == 0 || bias_elems != moe.num_experts || vocab_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "DeepSeek-V4 Vision layer {} bias contract is ptr=0x{:x}, elems={}/{}, vocab={}",
+                layer_idx, bias_ptr, bias_elems, moe.num_experts, vocab_size
+            )));
+        }
+        if moe.model_vocab_size != 0 && moe.model_vocab_size != vocab_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "DeepSeek-V4 Vision layer {} vocabulary mismatch: vision={} model={}",
+                layer_idx, vocab_size, moe.model_vocab_size
+            )));
+        }
+        moe.vision_bias_ptr = bias_ptr as u64;
+        moe.model_vocab_size = vocab_size;
         Ok(())
     }
 
@@ -44958,6 +45032,9 @@ impl GpuDecodeStore {
                         window as i32,
                         selected as i32,
                         1i32,
+                        0u64,
+                        0i32,
+                        0i32,
                     ),
                 )
                 .map_err(|error| format!("{} raw-window indices: {:?}", label, error))?;
@@ -48620,6 +48697,8 @@ impl GpuDecodeStore {
             fused_moe_w2_ctmp_floats: 0,
             deepseek_v4_hc_mult,
             deepseek_v4_sliding_window,
+            deepseek_v4_vision_max_tokens: graph.deepseek_v4_vision_max_tokens,
+            deepseek_v4_vision_active: false,
             deepseek_v4_index_topk,
             deepseek_v4_index_head_dim,
             deepseek_v4_static_compress_ratio,
@@ -48858,6 +48937,8 @@ impl GpuDecodeStore {
                 moe_gate_cols: 0,
                 moe_gate_bias_ptr: 0,
                 moe_e_score_corr_ptr: 0,
+                moe_vision_bias_ptr: 0,
+                moe_model_vocab_size: 0,
                 moe_hash_table_ptr: 0,
                 moe_hash_vocab_size: 0,
                 moe_num_experts: 0,
@@ -49805,6 +49886,8 @@ impl GpuDecodeStore {
                     if let Some(Some(moe_data)) = target_moe_layers.get(i) {
                         lw.moe_hash_table_ptr = moe_data.hash_table_ptr;
                         lw.moe_hash_vocab_size = moe_data.hash_vocab_size;
+                        lw.moe_vision_bias_ptr = moe_data.vision_bias_ptr;
+                        lw.moe_model_vocab_size = moe_data.model_vocab_size;
                         lw.moe_swiglu_limit = moe_data.swiglu_limit;
                         lw.shared_swiglu_limit = moe_data.shared_swiglu_limit;
                         lw.moe_deepseek_v4_activation = moe_data.deepseek_v4_activation;
@@ -49848,6 +49931,8 @@ impl GpuDecodeStore {
                         lw.moe_gate_cols = gw.cols;
                         lw.moe_gate_bias_ptr = moe_data.gate_bias_ptr;
                         lw.moe_e_score_corr_ptr = moe_data.e_score_corr_ptr;
+                        lw.moe_vision_bias_ptr = moe_data.vision_bias_ptr;
+                        lw.moe_model_vocab_size = moe_data.model_vocab_size;
                         lw.moe_hash_table_ptr = moe_data.hash_table_ptr;
                         lw.moe_hash_vocab_size = moe_data.hash_vocab_size;
                         lw.moe_num_experts = moe_data.num_experts;
@@ -49893,6 +49978,8 @@ impl GpuDecodeStore {
                         lw.moe_gate_cols = gw.cols;
                         lw.moe_gate_bias_ptr = moe_data.gate_bias_ptr;
                         lw.moe_e_score_corr_ptr = moe_data.e_score_corr_ptr;
+                        lw.moe_vision_bias_ptr = moe_data.vision_bias_ptr;
+                        lw.moe_model_vocab_size = moe_data.model_vocab_size;
                         lw.moe_hash_table_ptr = moe_data.hash_table_ptr;
                         lw.moe_hash_vocab_size = moe_data.hash_vocab_size;
                         lw.moe_num_experts = moe_data.num_experts;
@@ -86805,6 +86892,8 @@ impl GpuDecodeStore {
             gate_wid,
             gate_bias_ptr: gate_bias_ptr as u64,
             e_score_corr_ptr: e_score_corr_ptr as u64,
+            vision_bias_ptr: 0,
+            model_vocab_size: 0,
             hash_table_ptr: 0,
             hash_vocab_size: 0,
             shared_gate_wid,
