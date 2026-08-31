@@ -20,6 +20,7 @@ fn main() {
     // Force rerun when env changes (e.g. CUDA_HOME)
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=KRASIS_NVCC_CCBIN");
     println!("cargo:rerun-if-env-changed=KRASIS_BUILD_PEER_RTT_PROBE");
     println!("cargo:rerun-if-env-changed=KRASIS_BUILD_EXPERT_CODEC_PROBE");
 
@@ -189,12 +190,21 @@ fn run_status_timed(
 }
 
 fn nvcc_host_compiler_args() -> Vec<String> {
-    match std::env::var("KRASIS_NVCC_CCBIN") {
-        Ok(path) if !path.trim().is_empty() => {
-            vec!["-ccbin".to_string(), path]
-        }
-        _ => Vec::new(),
+    let mut args = Vec::new();
+    if cfg!(target_os = "linux") {
+        // CUDA 13.1's math_functions.h lacks the noexcept annotation that
+        // glibc 2.43 adds to its C23 rsqrt/rsqrtf declarations. nvcc enables
+        // GNU extensions by default, which exposes both incompatible
+        // declarations. The kernels do not require those host extensions.
+        args.push("-U_GNU_SOURCE".to_string());
     }
+    if let Ok(path) = std::env::var("KRASIS_NVCC_CCBIN") {
+        if !path.trim().is_empty() {
+            args.push("-ccbin".to_string());
+            args.push(path);
+        }
+    }
+    args
 }
 
 fn compile_peer_rtt_kernels() {
