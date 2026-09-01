@@ -68,10 +68,10 @@ Krasis release. Highlights:
   compact KV cache modes were built with Ampere compatibility in mind and do
   not require FP8-capable hardware.
 - Expanded validated model coverage across DeepSeek-V4-Flash-0731,
-  Qwen3-Coder-Next, Qwen3/3.5/3.6, Ornith, Step-3.7-Flash, Gemma 4, and
-  Nemotron MoE families. See the current per-family quality and tool-use
-  limitations below rather than assuming every quantized runtime is equally
-  faithful.
+  DeepSeek-V4-Flash-Vision-Exp, Qwen3-Coder-Next, Qwen3/3.5/3.6, Ornith,
+  Step-3.7-Flash, Gemma 4, and Nemotron MoE families. See the current per-family
+  quality and tool-use limitations below rather than assuming every quantized
+  runtime is equally faithful.
 - Added and hardened HCS expert residency management: measured startup
   calibration, prompt-conditioned reload, dynamic recency tail, per-stage
   budgets, soft-tier reload caps, and safe eviction/reload paths.
@@ -373,6 +373,39 @@ Useful endpoints:
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/timing`
+
+### Vision
+
+`DeepSeek-V4-Flash-Vision-Exp` uses the same OpenAI-compatible chat endpoint
+for text and images. Select `BF16` vision weights in the launcher (or pass
+`--vision-quant bf16`); this is the accuracy-qualified mode for the released
+vision tower. The model record returned by `GET /v1/models` reports
+`"vision": true` when image execution is available.
+
+Send images in a `user` message using an OpenAI `image_url` content part. Data
+URLs and HTTP(S) URLs are supported:
+
+```json
+{
+  "model": "MODEL_ID_FROM_V1_MODELS",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image_url",
+          "image_url": {"url": "data:image/png;base64,..."}
+        },
+        {"type": "text", "text": "Describe this image."}
+      ]
+    }
+  ]
+}
+```
+
+The released DeepSeek contract accepts images only in `user` turns. Local
+filesystem image paths remain disabled unless the operator explicitly enables
+them with `KRASIS_ALLOW_LOCAL_IMAGE_PATHS=1`.
 
 ### Tool Use
 
