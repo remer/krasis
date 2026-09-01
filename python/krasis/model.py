@@ -2466,8 +2466,16 @@ class KrasisModel:
 
     @staticmethod
     def _validate_deepseek_v4_image_roles(messages_json: str) -> None:
-        """DeepSeek's released API contract permits images only in user turns."""
+        """Allow image-bearing turns that DeepSeek renders as user input.
+
+        DeepSeek-V4 has no standalone tool role.  The bundled chat template
+        renders OpenAI ``tool`` messages inside a user ``<tool_result>`` block,
+        matching the released encoder's ``merge_tool_messages`` preprocessing.
+        Images returned by tools are therefore valid model input.  Images in
+        assistant, system, and other roles remain rejected fail-closed.
+        """
         messages = json.loads(messages_json)
+        allowed_image_roles = {"user", "tool"}
         for message_idx, message in enumerate(messages):
             content = message.get("content")
             if not isinstance(content, list):
@@ -2481,10 +2489,11 @@ class KrasisModel:
                     or "image" in part
                     or "image_url" in part
                 )
-                if is_image and message.get("role") != "user":
+                if is_image and message.get("role") not in allowed_image_roles:
                     raise ValueError(
                         "DeepSeek-V4-Flash-Vision-Exp accepts images only in "
-                        f"user messages; message {message_idx} has role "
+                        "user messages or tool results; "
+                        f"message {message_idx} has role "
                         f"{message.get('role')!r}"
                     )
 

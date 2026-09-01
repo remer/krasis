@@ -197,7 +197,25 @@ class DeepseekV4VisionTests(unittest.TestCase):
             model.quant_cfg.step_vision_quant = "int4"
             self.assertFalse(model.supports_deepseek_v4_image_inputs())
 
-    def test_images_outside_user_messages_fail_closed(self):
+    def test_images_in_tool_results_are_allowed(self):
+        messages = json.dumps(
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_vision",
+                    "content": [
+                        {"type": "text", "text": "Image loaded."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc"},
+                        },
+                    ],
+                }
+            ]
+        )
+        KrasisModel._validate_deepseek_v4_image_roles(messages)
+
+    def test_images_outside_user_or_tool_messages_fail_closed(self):
         messages = json.dumps(
             [
                 {
@@ -211,7 +229,7 @@ class DeepseekV4VisionTests(unittest.TestCase):
                 }
             ]
         )
-        with self.assertRaisesRegex(ValueError, "only in user messages"):
+        with self.assertRaisesRegex(ValueError, "user messages or tool results"):
             KrasisModel._validate_deepseek_v4_image_roles(messages)
 
 
