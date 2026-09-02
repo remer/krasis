@@ -7069,6 +7069,10 @@ pub struct PrefillModelConfig {
     // execution descriptor. All values are derived from registered layers.
     pub deepseek_v4_hc_mult: usize,
     pub deepseek_v4_sliding_window: usize,
+    pub deepseek_v4_vision_max_tokens: usize,
+    /// Request-scoped: reserve the widened image visibility window only when
+    /// a Vision prompt has supplied image block IDs.
+    pub deepseek_v4_vision_active: bool,
     pub deepseek_v4_index_topk: usize,
     pub deepseek_v4_index_head_dim: usize,
     pub deepseek_v4_static_compress_ratio: usize,
@@ -7311,6 +7315,40 @@ struct DsaPrefillWorkspaceGeometry {
 
 fn dsa_score_context_rows(logical_context_rows: usize, context_divisor: usize) -> usize {
     logical_context_rows / context_divisor.max(1)
+}
+
+fn dsa_prefill_needs_selection_expansion(configured_topk: usize, output_topk: usize) -> bool {
+    output_topk > configured_topk
+}
+
+fn deepseek_v4_indexer_workspace_geometry(
+    layer_idx: usize,
+    compress_ratio: usize,
+    index_topk: usize,
+    index_n_heads: usize,
+    index_head_dim: usize,
+) -> Result<DsaPrefillWorkspaceGeometry, String> {
+    if compress_ratio != 4 {
+        return Err(format!(
+            "DeepSeek-V4 indexer layer {} requires ratio-4 compressed context, got {}",
+            layer_idx, compress_ratio
+        ));
+    }
+    if index_topk == 0 || index_n_heads == 0 || index_head_dim == 0 {
+        return Err(format!(
+            "DeepSeek-V4 indexer layer {} has invalid workspace geometry: topk={} heads={} head_dim={}",
+            layer_idx, index_topk, index_n_heads, index_head_dim
+        ));
+    }
+    Ok(DsaPrefillWorkspaceGeometry {
+        index_topk,
+        output_topk: index_topk,
+        context_divisor: compress_ratio,
+        index_n_heads,
+        index_head_dim,
+        mla_num_heads: 0,
+        mla_ckv_cache_dim: 0,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7660,7 +7698,10 @@ impl DsaPrefillRequestWorkspace {
                     .ok_or_else(|| "DSA prefill raw selected-index size overflow".to_string())?,
             )
             .map_err(|error| format!("alloc DSA prefill selected indices: {error}"))?,
-            d_pool_selected_indices: if context_divisor > 1 {
+            d_pool_selected_indices: if dsa_prefill_needs_selection_expansion(
+                configured_topk,
+                output_topk,
+            ) {
                 Some(
                     GpuBuf::alloc_zeroed(plan.selection_elements).map_err(|error| {
                         format!("alloc DSA prefill pooled selected indices: {error}")
@@ -9159,6 +9200,8 @@ pub struct PrefillLayerWeights {
     pub moe_gate_cols: usize,       // hidden_size
     pub moe_gate_bias_ptr: u64,     // 0 = no bias
     pub moe_e_score_corr_ptr: u64,  // 0 = none
+    pub moe_vision_bias_ptr: u64,   // DeepSeek-V4 Vision [n_experts] FP32 or 0
+    pub moe_model_vocab_size: usize, // image token IDs are >= this boundary
     pub moe_hash_table_ptr: u64,    // DeepSeek-V4 [vocab, topk] I32 or 0
     pub moe_hash_vocab_size: usize,
     pub moe_num_experts: usize,
@@ -18047,6 +18090,8 @@ impl PrefillEngine {
         self.external_mrope_sin_ptr = mrope_sin_ptr;
         self.external_mrope_half_dim = mrope_half_dim;
         self.external_vision_block_ids_ptr = vision_block_ids_ptr;
+        self.config.deepseek_v4_vision_active = vision_block_ids_ptr != 0
+            && self.config.deepseek_v4_vision_max_tokens > 0;
     }
 
     pub fn clear_external_prefill_inputs(&mut self) {
@@ -18055,6 +18100,7 @@ impl PrefillEngine {
         self.external_mrope_sin_ptr = 0;
         self.external_mrope_half_dim = 0;
         self.external_vision_block_ids_ptr = 0;
+        self.config.deepseek_v4_vision_active = false;
     }
 
     pub fn last_prepare_post_alloc_free_mb(&self) -> usize {
@@ -37020,7 +37066,17 @@ impl PrefillEngine {
         } else {
             0
         };
-        let selected = window
+        let vision_max_tokens = if self.external_vision_block_ids_ptr != 0 {
+            self.config.deepseek_v4_vision_max_tokens
+        } else {
+            0
+        };
+        let raw_window_width = if vision_max_tokens > 0 {
+            end_pos.min(window.saturating_add(vision_max_tokens))
+        } else {
+            window
+        };
+        let selected = raw_window_width
             .checked_add(suffix_selected)
             .ok_or_else(|| format!("DeepSeek-V4 layer {} selected width overflow", layer_idx))?;
         let required_indices = m
@@ -37047,7 +37103,7 @@ impl PrefillEngine {
             ));
         }
         let index_threads = 256usize;
-        let index_blocks = window.div_ceil(index_threads);
+        let index_blocks = raw_window_width.div_ceil(index_threads);
         let mut wi0 = indices;
         let mut wi1 = positions;
         let mut wi2 = i32::try_from(m)
@@ -37057,12 +37113,21 @@ impl PrefillEngine {
         let mut wi4 = i32::try_from(selected)
             .map_err(|_| format!("DeepSeek-V4 layer {} selected width exceeds i32", layer_idx))?;
         let mut wi5 = 0i32;
+        let mut wi6 = if vision_max_tokens > 0 {
+            self.external_vision_block_ids_ptr
+        } else {
+            0
+        };
+        let mut wi7 = i32::try_from(end_pos)
+            .map_err(|_| format!("DeepSeek-V4 layer {} sequence length exceeds i32", layer_idx))?;
+        let mut wi8 = i32::try_from(vision_max_tokens)
+            .map_err(|_| format!("DeepSeek-V4 layer {} image span exceeds i32", layer_idx))?;
         unsafe {
             launch(
                 self.kernels.deepseek_v4_window_indices,
                 (
                     u32::try_from(index_blocks).map_err(|_| {
-                        format!("DeepSeek-V4 layer {} window grid exceeds u32", layer_idx)
+                        format!("DeepSeek-V4 layer {} raw-window grid exceeds u32", layer_idx)
                     })?,
                     u32::try_from(m).map_err(|_| {
                         format!("DeepSeek-V4 layer {} row grid exceeds u32", layer_idx)
@@ -37079,6 +37144,9 @@ impl PrefillEngine {
                     &mut wi3 as *mut _ as *mut std::ffi::c_void,
                     &mut wi4 as *mut _ as *mut std::ffi::c_void,
                     &mut wi5 as *mut _ as *mut std::ffi::c_void,
+                    &mut wi6 as *mut _ as *mut std::ffi::c_void,
+                    &mut wi7 as *mut _ as *mut std::ffi::c_void,
+                    &mut wi8 as *mut _ as *mut std::ffi::c_void,
                 ],
             )?;
         }
@@ -37097,7 +37165,7 @@ impl PrefillEngine {
                 let mut li5 = i32::try_from(selected).map_err(|_| {
                     format!("DeepSeek-V4 layer {} index stride exceeds i32", layer_idx)
                 })?;
-                let mut li6 = i32::try_from(window).map_err(|_| {
+                let mut li6 = i32::try_from(raw_window_width).map_err(|_| {
                     format!("DeepSeek-V4 layer {} index column exceeds i32", layer_idx)
                 })?;
                 let mut li7 = i32::try_from(end_pos).map_err(|_| {
@@ -37149,7 +37217,7 @@ impl PrefillEngine {
             let mut si4 = i32::try_from(selected).map_err(|_| {
                 format!("DeepSeek-V4 layer {} static stride exceeds i32", layer_idx)
             })?;
-            let mut si5 = i32::try_from(window).map_err(|_| {
+            let mut si5 = i32::try_from(raw_window_width).map_err(|_| {
                 format!("DeepSeek-V4 layer {} static column exceeds i32", layer_idx)
             })?;
             let mut si6 = i32::try_from(compressed_rows).map_err(|_| {
@@ -41382,22 +41450,19 @@ impl PrefillEngine {
             }
         }
         for (layer_idx, layer) in self.layer_weights.iter().enumerate() {
-            let Some(indexer) = layer
-                .deepseek_v4
-                .as_ref()
-                .and_then(|descriptor| descriptor.indexer.as_ref())
-            else {
+            let Some(descriptor) = layer.deepseek_v4.as_ref() else {
                 continue;
             };
-            let current = DsaPrefillWorkspaceGeometry {
-                index_topk: indexer.index_topk,
-                output_topk: indexer.index_topk,
-                context_divisor: 1,
-                index_n_heads: indexer.index_n_heads,
-                index_head_dim: indexer.index_head_dim,
-                mla_num_heads: 0,
-                mla_ckv_cache_dim: 0,
+            let Some(indexer) = descriptor.indexer.as_ref() else {
+                continue;
             };
+            let current = deepseek_v4_indexer_workspace_geometry(
+                layer_idx,
+                descriptor.compress_ratio,
+                indexer.index_topk,
+                indexer.index_n_heads,
+                indexer.index_head_dim,
+            )?;
             if let Some(expected) = geometry {
                 if expected != current {
                     return Err(format!(
@@ -59060,21 +59125,22 @@ impl PrefillEngine {
             unsafe {
                 if scoring_func == 2 {
                     let mut p3 = self.layer_weights[layer_idx].moe_e_score_corr_ptr;
-                    let mut p4 = self.layer_weights[layer_idx].moe_hash_table_ptr;
-                    let mut p5 = *self.scratch.d_token_ids.device_ptr();
-                    let mut p6 = n_experts as i32;
-                    let mut p7 = topk as i32;
-                    let mut p8 = i32::try_from(self.layer_weights[layer_idx].moe_hash_vocab_size)
+                    let mut p4 = self.layer_weights[layer_idx].moe_vision_bias_ptr;
+                    let mut p5 = self.layer_weights[layer_idx].moe_hash_table_ptr;
+                    let mut p6 = *self.scratch.d_token_ids.device_ptr();
+                    let mut p7 = n_experts as i32;
+                    let mut p8 = topk as i32;
+                    let mut p9 = i32::try_from(self.layer_weights[layer_idx].moe_model_vocab_size)
                         .map_err(|_| {
                         format!(
-                            "DeepSeek-V4 hash vocab exceeds CUDA i32 ABI at layer {}: {}",
-                            layer_idx, self.layer_weights[layer_idx].moe_hash_vocab_size
+                            "DeepSeek-V4 model vocab exceeds CUDA i32 ABI at layer {}: {}",
+                            layer_idx, self.layer_weights[layer_idx].moe_model_vocab_size
                         )
                     })?;
-                    if p4 != 0 && p8 <= 0 {
+                    if (p4 != 0 || p5 != 0) && p9 <= 0 {
                         return Err(format!(
-                            "DeepSeek-V4 hash router layer {} has a table but invalid vocab size {}",
-                            layer_idx, p8
+                            "DeepSeek-V4 router layer {} has hash/vision metadata but invalid vocab size {}",
+                            layer_idx, p9
                         ));
                     }
                     launch(
@@ -59093,6 +59159,7 @@ impl PrefillEngine {
                             &mut p6 as *mut _ as *mut std::ffi::c_void,
                             &mut p7 as *mut _ as *mut std::ffi::c_void,
                             &mut p8 as *mut _ as *mut std::ffi::c_void,
+                            &mut p9 as *mut _ as *mut std::ffi::c_void,
                         ],
                     )?;
                 } else if scoring_func == 1 {
@@ -67197,20 +67264,21 @@ impl PrefillEngine {
             unsafe {
                 if scoring_func == 2 {
                     let mut p3 = lw.moe_e_score_corr_ptr;
-                    let mut p4 = lw.moe_hash_table_ptr;
-                    let mut p5 = *self.scratch.d_token_ids.device_ptr();
-                    let mut p6 = n_experts as i32;
-                    let mut p7 = topk as i32;
-                    let mut p8 = i32::try_from(lw.moe_hash_vocab_size).map_err(|_| {
+                    let mut p4 = lw.moe_vision_bias_ptr;
+                    let mut p5 = lw.moe_hash_table_ptr;
+                    let mut p6 = *self.scratch.d_token_ids.device_ptr();
+                    let mut p7 = n_experts as i32;
+                    let mut p8 = topk as i32;
+                    let mut p9 = i32::try_from(lw.moe_model_vocab_size).map_err(|_| {
                         format!(
-                            "DeepSeek-V4 hash vocab exceeds CUDA i32 ABI at layer {}: {}",
-                            layer_idx, lw.moe_hash_vocab_size
+                            "DeepSeek-V4 model vocab exceeds CUDA i32 ABI at layer {}: {}",
+                            layer_idx, lw.moe_model_vocab_size
                         )
                     })?;
-                    if p4 != 0 && p8 <= 0 {
+                    if (p4 != 0 || p5 != 0) && p9 <= 0 {
                         return Err(format!(
-                            "DeepSeek-V4 hash router layer {} has a table but invalid vocab size {}",
-                            layer_idx, p8
+                            "DeepSeek-V4 router layer {} has hash/vision metadata but invalid vocab size {}",
+                            layer_idx, p9
                         ));
                     }
                     launch(
@@ -67229,6 +67297,7 @@ impl PrefillEngine {
                             &mut p6 as *mut _ as *mut std::ffi::c_void,
                             &mut p7 as *mut _ as *mut std::ffi::c_void,
                             &mut p8 as *mut _ as *mut std::ffi::c_void,
+                            &mut p9 as *mut _ as *mut std::ffi::c_void,
                         ],
                     )?;
                 } else if scoring_func == 1 {
@@ -72851,23 +72920,24 @@ impl PrefillEngine {
                 unsafe {
                     if scoring_func == 2 {
                         let mut p3 = self.layer_weights[layer_idx].moe_e_score_corr_ptr;
-                        let mut p4 = self.layer_weights[layer_idx].moe_hash_table_ptr;
-                        let mut p5 = *self.scratch.d_token_ids.device_ptr();
-                        let mut p6 = n_experts as i32;
-                        let mut p7 = topk as i32;
-                        let mut p8 = i32::try_from(
-                            self.layer_weights[layer_idx].moe_hash_vocab_size,
+                        let mut p4 = self.layer_weights[layer_idx].moe_vision_bias_ptr;
+                        let mut p5 = self.layer_weights[layer_idx].moe_hash_table_ptr;
+                        let mut p6 = *self.scratch.d_token_ids.device_ptr();
+                        let mut p7 = n_experts as i32;
+                        let mut p8 = topk as i32;
+                        let mut p9 = i32::try_from(
+                            self.layer_weights[layer_idx].moe_model_vocab_size,
                         )
                         .map_err(|_| {
                             format!(
-                                "DeepSeek-V4 prescan hash vocab exceeds CUDA i32 ABI at layer {}: {}",
-                                layer_idx, self.layer_weights[layer_idx].moe_hash_vocab_size
+                                "DeepSeek-V4 prescan model vocab exceeds CUDA i32 ABI at layer {}: {}",
+                                layer_idx, self.layer_weights[layer_idx].moe_model_vocab_size
                             )
                         })?;
-                        if p4 != 0 && p8 <= 0 {
+                        if (p4 != 0 || p5 != 0) && p9 <= 0 {
                             return Err(format!(
-                                "DeepSeek-V4 prescan hash router layer {} has a table but invalid vocab size {}",
-                                layer_idx, p8
+                                "DeepSeek-V4 prescan router layer {} has hash/vision metadata but invalid vocab size {}",
+                                layer_idx, p9
                             ));
                         }
                         launch(
@@ -72886,6 +72956,7 @@ impl PrefillEngine {
                                 &mut p6 as *mut _ as *mut std::ffi::c_void,
                                 &mut p7 as *mut _ as *mut std::ffi::c_void,
                                 &mut p8 as *mut _ as *mut std::ffi::c_void,
+                                &mut p9 as *mut _ as *mut std::ffi::c_void,
                             ],
                         )?;
                     } else if scoring_func == 1 {
@@ -75830,6 +75901,19 @@ fn prefill_cross_chunk_kv_staging_floats(
     prompt_tokens * kv_dim
 }
 
+fn deepseek_v4_raw_window_width(
+    sliding_window: usize,
+    vision_max_tokens: usize,
+    vision_active: bool,
+    prompt_tokens: usize,
+) -> usize {
+    if vision_active {
+        prompt_tokens.min(sliding_window.saturating_add(vision_max_tokens))
+    } else {
+        sliding_window
+    }
+}
+
 fn deepseek_v4_selected_per_token(config: &PrefillModelConfig, prompt_tokens: usize) -> usize {
     if config.deepseek_v4_hc_mult == 0 {
         return 0;
@@ -75839,8 +75923,13 @@ fn deepseek_v4_selected_per_token(config: &PrefillModelConfig, prompt_tokens: us
     } else {
         0
     };
-    config
-        .deepseek_v4_sliding_window
+    let raw_window = deepseek_v4_raw_window_width(
+        config.deepseek_v4_sliding_window,
+        config.deepseek_v4_vision_max_tokens,
+        config.deepseek_v4_vision_active,
+        prompt_tokens,
+    );
+    raw_window
         .saturating_add(config.deepseek_v4_index_topk.max(static_selected))
 }
 
@@ -77847,12 +77936,29 @@ mod chunk_plan_tests {
     use super::{
         build_balanced_prefill_chunk_plan, build_balanced_prefill_chunk_plan_at_boundary,
         build_prefill_chunk_plan, build_prefill_chunk_plan_at_boundary,
+        deepseek_v4_raw_window_width,
         glm5_hc_temp_state_elements_from_geometry,
         kimi_delta_state_elements_from_geometry,
         portable_predicted_w1_requires_exact_resize, prefill_chunk_guard_prompt_tokens,
         project_prefill_runtime_reserve_bytes, shared_moe_inter_scratch_elements,
         stage_exact_export_launch_scalars, stage_exact_export_range, PortablePredictedW1Policy,
     };
+
+    #[test]
+    fn deepseek_v4_vision_widens_scratch_only_for_image_requests() {
+        assert_eq!(
+            deepseek_v4_raw_window_width(4_096, 8_192, false, 20_000),
+            4_096
+        );
+        assert_eq!(
+            deepseek_v4_raw_window_width(4_096, 8_192, true, 20_000),
+            12_288
+        );
+        assert_eq!(
+            deepseek_v4_raw_window_width(4_096, 8_192, true, 10_000),
+            10_000
+        );
+    }
 
     #[test]
     fn glm5_hc_temp_state_is_checkpoint_geometry_derived() {
@@ -80237,24 +80343,31 @@ mod kernel_tests {
         let normalize = ctx.get_kernel("normalize_topk_weights_kernel");
         let logits = vec![-3.0f32, 1.0, 0.25, 2.5, -0.5, 1.75, 0.0, 3.0];
         let correction = vec![0.0f32, 0.0, 1.5, -0.25, 0.0, 0.0, 0.5, -1.0];
+        let vision_bias = vec![3.0f32, 0.0, 0.0, -2.0, 1.0, 0.0, 0.0, -4.0];
         let experts = logits.len();
         let topk = 3usize;
         let d_logits = ctx.dev.htod_copy(logits.clone()).unwrap();
         let d_correction = ctx.dev.htod_copy(correction.clone()).unwrap();
+        let d_vision_bias = ctx.dev.htod_copy(vision_bias.clone()).unwrap();
         let d_weights = ctx.alloc_f32(topk);
         let d_ids = ctx.alloc_i32(topk);
 
         let launch_router =
-            |hash_ptr: u64, token_ids_ptr: u64, hash_vocab_size: i32| -> (Vec<f32>, Vec<i32>) {
+            |vision_ptr: u64,
+             hash_ptr: u64,
+             token_ids_ptr: u64,
+             model_vocab_size: i32|
+             -> (Vec<f32>, Vec<i32>) {
                 let mut p0 = *d_weights.device_ptr() as u64;
                 let mut p1 = *d_ids.device_ptr() as u64;
                 let mut p2 = *d_logits.device_ptr() as u64;
                 let mut p3 = *d_correction.device_ptr() as u64;
-                let mut p4 = hash_ptr;
-                let mut p5 = token_ids_ptr;
-                let mut p6 = experts as i32;
-                let mut p7 = topk as i32;
-                let mut p8 = hash_vocab_size;
+                let mut p4 = vision_ptr;
+                let mut p5 = hash_ptr;
+                let mut p6 = token_ids_ptr;
+                let mut p7 = experts as i32;
+                let mut p8 = topk as i32;
+                let mut p9 = model_vocab_size;
                 unsafe {
                     launch(
                         router,
@@ -80272,6 +80385,7 @@ mod kernel_tests {
                             &mut p6 as *mut _ as *mut std::ffi::c_void,
                             &mut p7 as *mut _ as *mut std::ffi::c_void,
                             &mut p8 as *mut _ as *mut std::ffi::c_void,
+                            &mut p9 as *mut _ as *mut std::ffi::c_void,
                         ],
                     )
                     .unwrap();
@@ -80299,7 +80413,7 @@ mod kernel_tests {
                 )
             };
 
-        let (learned_weights, learned_ids) = launch_router(0, 0, 0);
+        let (learned_weights, learned_ids) = launch_router(0, 0, 0, 0);
         let (raw_expected, expected_ids) =
             compute_router_topk_cpu_reference(&logits, topk, 2, None, Some(&correction)).unwrap();
         let raw_sum = raw_expected.iter().sum::<f32>();
@@ -80321,6 +80435,7 @@ mod kernel_tests {
         let d_hash = ctx.dev.htod_copy(hash_table).unwrap();
         let d_token_ids = ctx.dev.htod_copy(vec![4i32]).unwrap();
         let (hash_weights, hash_ids) = launch_router(
+            0,
             *d_hash.device_ptr() as u64,
             *d_token_ids.device_ptr() as u64,
             vocab as i32,
@@ -80337,6 +80452,35 @@ mod kernel_tests {
         for (actual, expected) in hash_weights
             .iter()
             .zip(hash_raw.iter().map(|value| value / hash_sum))
+        {
+            assert!(
+                (actual - expected).abs() <= 2.0e-6,
+                "{actual} != {expected}"
+            );
+        }
+
+        // Image IDs are outside the text vocabulary. They must bypass both
+        // hash routing and the text correction bias, selecting with bias_vl.
+        let d_image_token_ids = ctx.dev.htod_copy(vec![vocab as i32 + 2]).unwrap();
+        let (vision_weights, vision_ids) = launch_router(
+            *d_vision_bias.device_ptr() as u64,
+            *d_hash.device_ptr() as u64,
+            *d_image_token_ids.device_ptr() as u64,
+            vocab as i32,
+        );
+        let (vision_raw, vision_expected_ids) = compute_router_topk_cpu_reference(
+            &logits,
+            topk,
+            2,
+            None,
+            Some(&vision_bias),
+        )
+        .unwrap();
+        assert_eq!(vision_ids, vision_expected_ids);
+        let vision_sum = vision_raw.iter().sum::<f32>();
+        for (actual, expected) in vision_weights
+            .iter()
+            .zip(vision_raw.iter().map(|value| value / vision_sum))
         {
             assert!(
                 (actual - expected).abs() <= 2.0e-6,
@@ -82745,6 +82889,9 @@ mod kernel_tests {
             let mut i3 = window as i32;
             let mut i4 = index_stride as i32;
             let mut i5 = 0i32;
+            let mut i6 = 0u64;
+            let mut i7 = 0i32;
+            let mut i8 = 0i32;
             launch(
                 window_kernel,
                 (1, index_rows as u32, 1),
@@ -82758,6 +82905,9 @@ mod kernel_tests {
                     &mut i3 as *mut _ as *mut std::ffi::c_void,
                     &mut i4 as *mut _ as *mut std::ffi::c_void,
                     &mut i5 as *mut _ as *mut std::ffi::c_void,
+                    &mut i6 as *mut _ as *mut std::ffi::c_void,
+                    &mut i7 as *mut _ as *mut std::ffi::c_void,
+                    &mut i8 as *mut _ as *mut std::ffi::c_void,
                 ],
             )
             .unwrap();
@@ -82811,6 +82961,9 @@ mod kernel_tests {
             let mut i3 = window as i32;
             let mut i4 = window as i32;
             let mut i5 = 1i32;
+            let mut i6 = 0u64;
+            let mut i7 = 0i32;
+            let mut i8 = 0i32;
             launch(
                 window_kernel,
                 (1, index_rows as u32, 1),
@@ -82824,6 +82977,9 @@ mod kernel_tests {
                     &mut i3 as *mut _ as *mut std::ffi::c_void,
                     &mut i4 as *mut _ as *mut std::ffi::c_void,
                     &mut i5 as *mut _ as *mut std::ffi::c_void,
+                    &mut i6 as *mut _ as *mut std::ffi::c_void,
+                    &mut i7 as *mut _ as *mut std::ffi::c_void,
+                    &mut i8 as *mut _ as *mut std::ffi::c_void,
                 ],
             )
             .unwrap();
@@ -82832,6 +82988,57 @@ mod kernel_tests {
         assert_eq!(
             ctx.dev.dtoh_sync_copy(&d_ring_indices).unwrap(),
             vec![0, 1, 2, -1, 0, 1, 2, 3]
+        );
+
+        // Vision rows preserve the ordinary causal prefix but can see through
+        // the end of their own image block, matching the released reference.
+        let vision_positions = vec![1i32, 2, 5];
+        let vision_blocks = vec![-1i32, -1, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1];
+        let d_vision_positions = ctx.dev.htod_copy(vision_positions).unwrap();
+        let d_vision_blocks = ctx.dev.htod_copy(vision_blocks).unwrap();
+        let vision_rows = 3usize;
+        let vision_max = 8usize;
+        let sequence_len = 12usize;
+        let vision_width = sequence_len.min(window + vision_max);
+        let d_vision_indices = ctx.alloc_i32(vision_rows * vision_width);
+        unsafe {
+            let mut i0 = *d_vision_indices.device_ptr() as u64;
+            let mut i1 = *d_vision_positions.device_ptr() as u64;
+            let mut i2 = vision_rows as i32;
+            let mut i3 = window as i32;
+            let mut i4 = vision_width as i32;
+            let mut i5 = 0i32;
+            let mut i6 = *d_vision_blocks.device_ptr() as u64;
+            let mut i7 = sequence_len as i32;
+            let mut i8 = vision_max as i32;
+            launch(
+                window_kernel,
+                (1, vision_rows as u32, 1),
+                (32, 1, 1),
+                0,
+                ctx.stream(),
+                &mut [
+                    &mut i0 as *mut _ as *mut std::ffi::c_void,
+                    &mut i1 as *mut _ as *mut std::ffi::c_void,
+                    &mut i2 as *mut _ as *mut std::ffi::c_void,
+                    &mut i3 as *mut _ as *mut std::ffi::c_void,
+                    &mut i4 as *mut _ as *mut std::ffi::c_void,
+                    &mut i5 as *mut _ as *mut std::ffi::c_void,
+                    &mut i6 as *mut _ as *mut std::ffi::c_void,
+                    &mut i7 as *mut _ as *mut std::ffi::c_void,
+                    &mut i8 as *mut _ as *mut std::ffi::c_void,
+                ],
+            )
+            .unwrap();
+        }
+        ctx.dev.synchronize().unwrap();
+        assert_eq!(
+            ctx.dev.dtoh_sync_copy(&d_vision_indices).unwrap(),
+            vec![
+                0, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                0, 1, 2, 3, 4, 5, 6, 7, -1, -1, -1, -1,
+                2, 3, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1,
+            ]
         );
 
         // Chunk continuation must be identical to the one-shot pooling
@@ -83192,6 +83399,17 @@ mod kernel_tests {
         assert_eq!(dsa_score_context_rows(303, 4), 75);
         assert_eq!(dsa_score_context_rows(304, 4), 76);
         assert_eq!(dsa_score_context_rows(303, 1), 303);
+        let deepseek_v4 =
+            deepseek_v4_indexer_workspace_geometry(2, 4, 512, 64, 128).unwrap();
+        assert_eq!(deepseek_v4.context_divisor, 4);
+        assert_eq!(deepseek_v4.index_topk, 512);
+        assert_eq!(deepseek_v4.output_topk, 512);
+        assert!(!dsa_prefill_needs_selection_expansion(
+            deepseek_v4.index_topk,
+            deepseek_v4.output_topk,
+        ));
+        assert!(deepseek_v4_indexer_workspace_geometry(2, 1, 512, 64, 128).is_err());
+        assert!(deepseek_v4_indexer_workspace_geometry(2, 4, 0, 64, 128).is_err());
         assert_eq!(
             glm5_ffn_kind(true, false).unwrap(),
             Glm5FfnKind::RoutedMoe
@@ -83221,6 +83439,7 @@ mod kernel_tests {
             index_kpool_always_select_tail: true,
         };
         assert_eq!(pooled.workspace_selection_geometry().unwrap(), (512, 2051, 4));
+        assert!(dsa_prefill_needs_selection_expansion(512, 2051));
         assert_eq!(
             DsaPrefillLayerDescriptor {
                 index_kpool_compress: false,

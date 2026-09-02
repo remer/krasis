@@ -91,6 +91,16 @@ from krasis.gemma4_vision import (
     Gemma4VisionModel,
 )
 from krasis.glm53_vision import Glm53ImagePreprocessor, Glm53VisionConfig, Glm53VisionModel
+from krasis.deepseek_v4_vision import (
+    IMAGE,
+    IMAGE_PLACEHOLDER,
+    DeepseekV4Aligner,
+    DeepseekV4ImagePreprocessor,
+    DeepseekV4VisionConfig,
+    DeepseekV4VisionModel,
+    expand_image_placeholders,
+    keep_vision_norms_fp32,
+)
 from krasis.step_vision_int4 import quantize_step_vision_modules_int4, quantize_vision_modules_int4
 
 from krasis.tokenizer import Tokenizer
@@ -972,6 +982,12 @@ class KrasisModel:
         self._glm53_vision_raw_config = None
         self._glm53_vision_quant_mode = None
         self._glm53_vision_quant_stats = None
+        self._deepseek_v4_vision_processor = None
+        self._deepseek_v4_vision_model = None
+        self._deepseek_v4_vision_aligner = None
+        self._deepseek_v4_vision_special = None
+        self._deepseek_v4_vision_config = None
+        self._deepseek_v4_vision_quant_mode = None
         self._last_multimodal_prefill_tensors = None
 
     def supports_image_inputs(self) -> bool:
@@ -981,7 +997,46 @@ class KrasisModel:
             or self.supports_step_image_inputs()
             or self.supports_gemma_image_inputs()
             or self.supports_glm53_image_inputs()
+            or self.supports_deepseek_v4_image_inputs()
         )
+
+    def supports_deepseek_v4_image_inputs(self) -> bool:
+        """Return True only for the official, complete BF16 V4 vision assets."""
+        if not getattr(self.cfg, "is_deepseek_v4_vision", False):
+            return False
+        vision_quant = str(
+            getattr(getattr(self, "quant_cfg", None), "step_vision_quant", "int4")
+            or "int4"
+        ).lower()
+        if vision_quant != "bf16":
+            return False
+        index_path = os.path.join(
+            self.cfg.model_path, "model.safetensors.index.json"
+        )
+        if not os.path.isfile(index_path):
+            return False
+        try:
+            DeepseekV4VisionConfig.from_model_config(self.cfg)
+            with open(index_path, encoding="utf-8") as handle:
+                weight_map = json.load(handle).get("weight_map", {})
+            required = {
+                "vision.patch_embed.proj.weight",
+                "vision.patch_embed.proj.bias",
+                "vision.blocks.0.attn.wqkv.weight",
+                f"vision.blocks.{self.cfg.vision_n_layers - 1}.attn.wqkv.weight",
+                "vision.norm.weight",
+                "aligner.w1.weight",
+                "aligner.w1.bias",
+                "aligner.w2.weight",
+                "aligner.w2.bias",
+                "image_start",
+                "image_pad",
+                "image_newline",
+                "image_end",
+            }
+            return required.issubset(weight_map)
+        except Exception:
+            return False
 
     def supports_qwen_image_inputs(self) -> bool:
         """Return True when the loaded model directory contains Qwen image assets."""
@@ -1622,6 +1677,145 @@ class KrasisModel:
         )
         return vision
 
+    def _ensure_deepseek_v4_vision_model(self):
+        """Load the official V4 ViT, aligner, and sentinel embeddings on CPU."""
+        vision_quant = str(
+            getattr(self.quant_cfg, "step_vision_quant", "int4") or "int4"
+        ).lower()
+        if vision_quant != "bf16":
+            raise RuntimeError(
+                "DeepSeek-V4-Flash-Vision-Exp image execution is initially "
+                "accuracy-qualified only with CFG_VISION_QUANT=bf16"
+            )
+        if self._deepseek_v4_vision_config is None:
+            vision_cfg = DeepseekV4VisionConfig.from_model_config(self.cfg)
+            self._deepseek_v4_vision_config = vision_cfg
+            self._deepseek_v4_vision_processor = DeepseekV4ImagePreprocessor(
+                vision_cfg
+            )
+
+        if (
+            self._deepseek_v4_vision_model is not None
+            and self._deepseek_v4_vision_aligner is not None
+            and self._deepseek_v4_vision_special is not None
+        ):
+            return (
+                self._deepseek_v4_vision_model,
+                self._deepseek_v4_vision_aligner,
+                self._deepseek_v4_vision_special,
+            )
+
+        vision_cfg = self._deepseek_v4_vision_config
+        log_ram_ledger("before-deepseek-v4-vision-load")
+        vision = DeepseekV4VisionModel(vision_cfg).to(dtype=torch.bfloat16)
+        aligner = DeepseekV4Aligner(vision_cfg).to(dtype=torch.bfloat16)
+        # DeepSeek's reference keeps vision RMSNorm parameters and arithmetic
+        # in FP32 even though projection weights are BF16.
+        keep_vision_norms_fp32(vision)
+
+        index_path = os.path.join(
+            self.cfg.model_path, "model.safetensors.index.json"
+        )
+        with open(index_path, encoding="utf-8") as handle:
+            weight_map = json.load(handle)["weight_map"]
+        shard_to_keys = {}
+        special_names = {
+            "image_start",
+            "image_pad",
+            "image_newline",
+            "image_end",
+        }
+        for key, shard in weight_map.items():
+            if (
+                key.startswith("vision.")
+                or key.startswith("aligner.")
+                or key in special_names
+            ):
+                shard_to_keys.setdefault(shard, []).append(key)
+        if not shard_to_keys:
+            raise RuntimeError(
+                "No DeepSeek-V4 vision/aligner tensors found in safetensors index"
+            )
+
+        vision_state = {}
+        aligner_state = {}
+        special = {}
+        for shard, keys in shard_to_keys.items():
+            shard_path = os.path.join(self.cfg.model_path, shard)
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                for key in keys:
+                    tensor = handle.get_tensor(key)
+                    if key.startswith("vision."):
+                        vision_state[key.removeprefix("vision.")] = tensor
+                    elif key.startswith("aligner."):
+                        aligner_state[key.removeprefix("aligner.")] = tensor
+                    else:
+                        special[key] = tensor
+
+        missing_special = sorted(special_names - set(special))
+        if missing_special:
+            raise RuntimeError(
+                "DeepSeek-V4 vision checkpoint is missing sentinel embeddings: "
+                + ", ".join(missing_special)
+            )
+        missing, unexpected = vision.load_state_dict(vision_state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "DeepSeek-V4 vision state mismatch: "
+                f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+            )
+        missing, unexpected = aligner.load_state_dict(
+            aligner_state, strict=False
+        )
+        if missing or unexpected:
+            raise RuntimeError(
+                "DeepSeek-V4 aligner state mismatch: "
+                f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+            )
+        for name, tensor in special.items():
+            if tuple(tensor.shape) != (self.cfg.hidden_size,):
+                raise RuntimeError(
+                    f"DeepSeek-V4 {name} shape {tuple(tensor.shape)} != "
+                    f"({self.cfg.hidden_size},)"
+                )
+            special[name] = tensor.to(dtype=torch.bfloat16).contiguous()
+
+        state_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                list(vision_state.values())
+                + list(aligner_state.values())
+                + list(special.values())
+            )
+        )
+        del vision_state, aligner_state
+        gc.collect()
+        vision.eval().requires_grad_(False)
+        aligner.eval().requires_grad_(False)
+        self._deepseek_v4_vision_model = vision
+        self._deepseek_v4_vision_aligner = aligner
+        self._deepseek_v4_vision_special = special
+        self._deepseek_v4_vision_quant_mode = vision_quant
+        param_bytes, buffer_bytes = self._module_param_buffer_bytes(
+            vision, aligner
+        )
+        log_ram_ledger(
+            "after-deepseek-v4-vision-load",
+            {
+                "vision_params": param_bytes,
+                "vision_buffers": buffer_bytes,
+            },
+        )
+        logger.info(
+            "Loaded DeepSeek-V4 vision tower on CPU: quant=%s params_mb=%.1f "
+            "buffers_mb=%.1f state_mb=%.1f",
+            vision_quant,
+            param_bytes / (1024 * 1024),
+            buffer_bytes / (1024 * 1024),
+            state_bytes / (1024 * 1024),
+        )
+        return vision, aligner, special
+
     def _release_qwen_vision_gpu(self, vision, device, label: str = "after-qwen-vision-release"):
         if getattr(device, "type", None) != "cuda":
             return
@@ -1637,6 +1831,24 @@ class KrasisModel:
         if getattr(device, "type", None) != "cuda":
             return
         try:
+            vision.to("cpu")
+        finally:
+            torch.cuda.empty_cache()
+            log_ram_ledger(label)
+            if _vram_ledger_enabled():
+                _vram_checkpoint(label, [device])
+
+    def _release_deepseek_v4_vision_gpu(
+        self,
+        vision,
+        aligner,
+        device,
+        label: str = "after-deepseek-v4-vision-release",
+    ):
+        if getattr(device, "type", None) != "cuda":
+            return
+        try:
+            aligner.to("cpu")
             vision.to("cpu")
         finally:
             torch.cuda.empty_cache()
@@ -2252,6 +2464,206 @@ class KrasisModel:
             "image_tokens": int(expected_image_tokens),
         }
 
+    @staticmethod
+    def _validate_deepseek_v4_image_roles(messages_json: str) -> None:
+        """Allow image-bearing turns that DeepSeek renders as user input.
+
+        DeepSeek-V4 has no standalone tool role.  The bundled chat template
+        renders OpenAI ``tool`` messages inside a user ``<tool_result>`` block,
+        matching the released encoder's ``merge_tool_messages`` preprocessing.
+        Images returned by tools are therefore valid model input.  Images in
+        assistant, system, and other roles remain rejected fail-closed.
+        """
+        messages = json.loads(messages_json)
+        allowed_image_roles = {"user", "tool"}
+        for message_idx, message in enumerate(messages):
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                is_image = (
+                    part_type in ("image", "image_url", "input_image")
+                    or "image" in part
+                    or "image_url" in part
+                )
+                if is_image and message.get("role") not in allowed_image_roles:
+                    raise ValueError(
+                        "DeepSeek-V4-Flash-Vision-Exp accepts images only in "
+                        "user messages or tool results; "
+                        f"message {message_idx} has role "
+                        f"{message.get('role')!r}"
+                    )
+
+    def _build_deepseek_v4_multimodal_prefill_inputs(
+        self,
+        messages_json: str,
+        rendered_prompt: str,
+    ):
+        """Build official sentinel IDs, image embeddings, and visibility spans."""
+        if self.embedding is None:
+            raise RuntimeError("Model embedding is not loaded")
+        self._validate_deepseek_v4_image_roles(messages_json)
+        images = self._extract_openai_images(messages_json)
+        vision, aligner, special = self._ensure_deepseek_v4_vision_model()
+        processor = self._deepseek_v4_vision_processor
+        prepared_images = [processor(image) for image in images]
+
+        if self.tokenizer is None:
+            self.tokenizer = Tokenizer(self.cfg.model_path)
+        tokenizer_vocab = self.tokenizer.tokenizer.get_vocab()
+        placeholder_token_id = tokenizer_vocab.get(IMAGE_PLACEHOLDER)
+        if not isinstance(placeholder_token_id, int):
+            raise ValueError(
+                f"DeepSeek-V4 tokenizer has no {IMAGE_PLACEHOLDER!r} token"
+            )
+        raw_ids = self.tokenizer.encode(
+            rendered_prompt,
+            add_special_tokens=False,
+        )
+        expanded_ids, attention_block_ids, blocks = expand_image_placeholders(
+            raw_ids,
+            placeholder_token_id,
+            prepared_images,
+            self.cfg.vocab_size,
+        )
+
+        device = self.embedding.device
+        input_ids = torch.tensor(expanded_ids, dtype=torch.long, device=device)
+        vision_block_ids = torch.tensor(
+            attention_block_ids,
+            dtype=torch.int32,
+            device=device,
+        )
+        safe_input_ids = torch.where(
+            input_ids < self.cfg.vocab_size,
+            input_ids,
+            torch.zeros_like(input_ids),
+        )
+        inputs_embeds = self.embedding[safe_input_ids].clone()
+
+        vision_param_bytes, vision_buffer_bytes = self._module_param_buffer_bytes(
+            vision, aligner
+        )
+        vision_resident_bytes = vision_param_bytes + vision_buffer_bytes
+        expected_image_tokens = sum(int(block.types.numel()) for block in blocks)
+        try:
+            if getattr(device, "type", None) == "cuda":
+                free_before, total = torch.cuda.mem_get_info(device)
+                logger.info(
+                    "DeepSeek-V4 image request staging: quant=bf16 images=%d "
+                    "image_tokens=%d raw_prompt_tokens=%d expanded_prompt_tokens=%d "
+                    "free_vram_mb=%d total_vram_mb=%d vision_resident_mb=%.1f",
+                    len(images),
+                    expected_image_tokens,
+                    len(raw_ids),
+                    len(expanded_ids),
+                    int(free_before // (1024 * 1024)),
+                    int(total // (1024 * 1024)),
+                    vision_resident_bytes / (1024 * 1024),
+                )
+            if _vram_ledger_enabled():
+                _vram_checkpoint("before-deepseek-v4-vision-to-gpu", [device])
+            vision = vision.to(device=device)
+            aligner = aligner.to(device=device)
+            if _vram_ledger_enabled():
+                _vram_checkpoint("after-deepseek-v4-vision-to-gpu", [device])
+
+            special_params = torch.stack(
+                [
+                    special["image_start"],
+                    special["image_pad"],
+                    special["image_pad"],
+                    special["image_newline"],
+                    special["image_end"],
+                ]
+            ).to(device=device, dtype=inputs_embeds.dtype)
+            with torch.inference_mode():
+                for block in blocks:
+                    image = block.image
+                    patches = image.patches.to(
+                        device=device,
+                        dtype=vision.patch_embed.proj.weight.dtype,
+                    )
+                    image_embeds = aligner(
+                        vision(patches, image.n_vit_h, image.n_vit_w),
+                        image.n_vit_h,
+                        image.n_vit_w,
+                    )
+                    perm = block.perm.to(device=device)
+                    image_embeds = image_embeds[perm].to(
+                        dtype=inputs_embeds.dtype
+                    )
+                    types = block.types.to(device=device)
+                    block_embeds = special_params[types]
+                    image_mask = types == IMAGE
+                    if int(image_mask.sum().item()) != int(image_embeds.shape[0]):
+                        raise RuntimeError(
+                            "DeepSeek-V4 image feature/token mismatch: "
+                            f"tokens={int(image_mask.sum().item())} "
+                            f"features={int(image_embeds.shape[0])}"
+                        )
+                    block_embeds[image_mask] = image_embeds
+                    end = block.start + int(block.types.numel())
+                    inputs_embeds[block.start:end] = block_embeds
+                if getattr(device, "type", None) == "cuda":
+                    torch.cuda.synchronize(device)
+        except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as error:
+            self._last_multimodal_prefill_tensors = None
+            self._release_deepseek_v4_vision_gpu(
+                vision,
+                aligner,
+                device,
+                "after-deepseek-v4-vision-oom-release",
+            )
+            raise KrasisVisionVramError(
+                "VRAM is too constrained for this DeepSeek-V4 image request. "
+                f"Transient BF16 vision staging needs about "
+                f"{vision_resident_bytes / (1024 * 1024):.1f} MB for vision "
+                f"parameters plus activations; images={len(images)}, "
+                f"image_tokens={expected_image_tokens}."
+            ) from error
+        except RuntimeError as error:
+            if "out of memory" in str(error).lower():
+                self._last_multimodal_prefill_tensors = None
+                self._release_deepseek_v4_vision_gpu(
+                    vision,
+                    aligner,
+                    device,
+                    "after-deepseek-v4-vision-oom-release",
+                )
+                raise KrasisVisionVramError(
+                    "VRAM is too constrained for this DeepSeek-V4 image request; "
+                    f"images={len(images)}, image_tokens={expected_image_tokens}."
+                ) from error
+            self._release_deepseek_v4_vision_gpu(vision, aligner, device)
+            raise
+        except Exception:
+            self._release_deepseek_v4_vision_gpu(vision, aligner, device)
+            raise
+
+        self._release_deepseek_v4_vision_gpu(vision, aligner, device)
+        self._last_multimodal_prefill_tensors = (
+            inputs_embeds,
+            vision_block_ids,
+        )
+        return {
+            "token_ids": [int(token) for token in expanded_ids],
+            "prompt_tokens": int(input_ids.numel()),
+            "hidden_size": int(inputs_embeds.shape[-1]),
+            "inputs_embeds_ptr": int(inputs_embeds.data_ptr()),
+            "mrope_cos_ptr": 0,
+            "mrope_sin_ptr": 0,
+            "mrope_half_dim": 0,
+            "rope_delta": 0,
+            "vision_block_ids_ptr": int(vision_block_ids.data_ptr()),
+            "image_count": int(len(images)),
+            "image_tokens": int(expected_image_tokens),
+            "requires_single_chunk": True,
+        }
+
     def _build_glm53_multimodal_prefill_inputs(self, messages_json: str, rendered_prompt: str):
         """Build text-width image embeddings for a GLM-5.3 image request."""
         if self.embedding is None:
@@ -2387,6 +2799,10 @@ class KrasisModel:
             return self._build_gemma_multimodal_prefill_inputs(messages_json, rendered_prompt)
         if self.supports_glm53_image_inputs():
             return self._build_glm53_multimodal_prefill_inputs(messages_json, rendered_prompt)
+        if self.supports_deepseek_v4_image_inputs():
+            return self._build_deepseek_v4_multimodal_prefill_inputs(
+                messages_json, rendered_prompt
+            )
         raise ValueError("loaded model does not support Krasis image inputs")
 
     def clear_multimodal_prefill_inputs(self):
@@ -2899,6 +3315,8 @@ class KrasisModel:
                 result["gate"]["bias"] = layer.gate_bias
             if layer.e_score_correction_bias is not None:
                 result["gate"]["e_score_correction_bias"] = layer.e_score_correction_bias
+            if getattr(layer, "vision_router_bias", None) is not None:
+                result["gate"]["vision_bias"] = layer.vision_router_bias
             if getattr(layer, "router_tid2eid", None) is not None:
                 result["gate"]["tid2eid"] = layer.router_tid2eid
             if getattr(layer, "router_input_scale", None) is not None:
@@ -6380,6 +6798,8 @@ class KrasisModel:
                     total += tensor_bytes(layer.gate_bias)
                 if layer.e_score_correction_bias is not None:
                     total += tensor_bytes(layer.e_score_correction_bias)
+                if getattr(layer, "vision_router_bias", None) is not None:
+                    total += tensor_bytes(layer.vision_router_bias)
                 if getattr(layer, "router_tid2eid", None) is not None:
                     total += tensor_bytes(layer.router_tid2eid)
                 if layer.shared_expert is not None:
@@ -6499,9 +6919,11 @@ class KrasisModel:
             _add_any("router_weights", getattr(layer, "gate_weight", None))
             _add_any("router_weights", getattr(layer, "gate_bias", None))
             _add_any("router_weights", getattr(layer, "e_score_correction_bias", None))
+            _add_any("router_weights", getattr(layer, "vision_router_bias", None))
             _add_any("router_fp32_mirrors", getattr(layer, "_gate_weight_f32", None))
             _add_any("router_fp32_mirrors", getattr(layer, "_gate_bias_f32", None))
             _add_any("router_fp32_mirrors", getattr(layer, "_e_score_correction_bias_f32", None))
+            _add_any("router_fp32_mirrors", getattr(layer, "_vision_router_bias_f32", None))
             _add_any("shared_expert", getattr(layer, "shared_expert", None))
             _add_any("shared_expert_gate", getattr(layer, "shared_expert_gate", None))
             _add_any("dense_mlp", getattr(layer, "dense_mlp", None))
@@ -6620,6 +7042,7 @@ class KrasisModel:
                     "_gate_weight_f32",
                     "_gate_bias_f32",
                     "_e_score_correction_bias_f32",
+                    "_vision_router_bias_f32",
                 ):
                     value = getattr(layer, attr, None)
                     bytes_ = _cuda_bytes(value)
@@ -6861,6 +7284,9 @@ class KrasisModel:
                     if "e_score_correction_bias" in gate_d:
                         layer.e_score_correction_bias = gate_d["e_score_correction_bias"].to(dev)
                         layer._e_score_correction_bias_f32 = layer.e_score_correction_bias.float()
+                    if "vision_bias" in gate_d:
+                        layer.vision_router_bias = gate_d["vision_bias"].to(dev)
+                        layer._vision_router_bias_f32 = layer.vision_router_bias.float()
                     if "input_scale" in gate_d:
                         layer.router_input_scale = gate_d["input_scale"].to(dev)
                     if "per_expert_scale" in gate_d:
@@ -7108,6 +7534,7 @@ class KrasisModel:
             layer.gate_weight = None
             layer.gate_bias = None
             layer.e_score_correction_bias = None
+            layer.vision_router_bias = None
             layer.shared_expert = None
             layer.shared_expert_gate = None
 
@@ -7366,7 +7793,12 @@ class KrasisModel:
             # ── MoE weights ──
             if layer.is_moe:
                 moe_saved = {}
-                for name in ("gate_weight", "gate_bias", "e_score_correction_bias"):
+                for name in (
+                    "gate_weight",
+                    "gate_bias",
+                    "e_score_correction_bias",
+                    "vision_router_bias",
+                ):
                     val = getattr(layer, name, None)
                     if val is not None:
                         moe_saved[name] = val
@@ -7387,11 +7819,16 @@ class KrasisModel:
                 moe_saved["_gate_weight_f32"] = layer._gate_weight_f32
                 moe_saved["_gate_bias_f32"] = layer._gate_bias_f32
                 moe_saved["_e_score_correction_bias_f32"] = layer._e_score_correction_bias_f32
+                moe_saved["_vision_router_bias_f32"] = layer._vision_router_bias_f32
                 layer._gate_weight_f32 = layer.gate_weight.float() if layer.gate_weight is not None else None
                 layer._gate_bias_f32 = layer.gate_bias.float() if layer.gate_bias is not None else None
                 layer._e_score_correction_bias_f32 = (
                     layer.e_score_correction_bias.float()
                     if layer.e_score_correction_bias is not None else None
+                )
+                layer._vision_router_bias_f32 = (
+                    layer.vision_router_bias.float()
+                    if layer.vision_router_bias is not None else None
                 )
 
                 # Nullify CUDA graph (device-bound)
@@ -7462,7 +7899,12 @@ class KrasisModel:
             # MoE
             if "moe" in ls:
                 ms = ls["moe"]
-                for name in ("gate_weight", "gate_bias", "e_score_correction_bias"):
+                for name in (
+                    "gate_weight",
+                    "gate_bias",
+                    "e_score_correction_bias",
+                    "vision_router_bias",
+                ):
                     if name in ms:
                         setattr(layer, name, ms[name])
                 if "shared_expert" in ms:
@@ -7472,6 +7914,7 @@ class KrasisModel:
                 layer._gate_weight_f32 = ms["_gate_weight_f32"]
                 layer._gate_bias_f32 = ms["_gate_bias_f32"]
                 layer._e_score_correction_bias_f32 = ms["_e_score_correction_bias_f32"]
+                layer._vision_router_bias_f32 = ms["_vision_router_bias_f32"]
                 layer._se_graph = ms["_se_graph"]
                 layer._se_input = ms["_se_input"]
                 layer._se_output = ms["_se_output"]
@@ -9345,6 +9788,48 @@ class KrasisModel:
                     f"DeepSeek-V4 non-hash layer {layer_idx} unexpectedly has tid2eid"
                 )
 
+    def _register_deepseek_v4_vision_router_biases(
+        self,
+        store,
+        device: torch.device,
+        keepalive: list,
+        layer_indices=None,
+    ) -> None:
+        """Register the checkpoint's image-token expert-selection bias.
+
+        DeepSeek-V4 Vision routes image sentinel/patch tokens with ``bias_vl``
+        in every MoE layer.  Text tokens retain the base model's hash or
+        learned-bias routing contract.  The CUDA runtime borrows these device
+        pointers, so keep each converted tensor alive with the store.
+        """
+        if not self.cfg.is_deepseek_v4_vision:
+            return
+        selected = range(len(self.layers)) if layer_indices is None else layer_indices
+        expected = (self.cfg.n_routed_experts,)
+        for layer_idx in selected:
+            layer = self.layers[layer_idx]
+            bias = getattr(layer, "vision_router_bias", None)
+            if bias is None:
+                raise RuntimeError(
+                    f"DeepSeek-V4 Vision layer {layer_idx} has no bias_vl"
+                )
+            if tuple(bias.shape) != expected:
+                raise RuntimeError(
+                    f"DeepSeek-V4 Vision layer {layer_idx} bias_vl shape "
+                    f"{tuple(bias.shape)} != {expected}"
+                )
+            bias_f32 = bias.to(
+                device=device, dtype=torch.float32, non_blocking=True
+            ).contiguous()
+            keepalive.append(bias_f32)
+            store.set_moe_deepseek_v4_vision_bias(
+                layer_idx=layer_idx,
+                bias_ptr=bias_f32.data_ptr(),
+                bias_elems=bias_f32.numel(),
+                vocab_size=self.cfg.vocab_size,
+                max_image_tokens=self.cfg.vision_max_n_token,
+            )
+
     @staticmethod
     def _register_sequence_state_tensor(
         store,
@@ -10913,6 +11398,9 @@ class KrasisModel:
             self._register_deepseek_v4_hash_tables(
                 store, device, self._rust_decode_weights
             )
+            self._register_deepseek_v4_vision_router_biases(
+                store, device, self._rust_decode_weights
+            )
             if self.cfg.swiglu_limits or self.cfg.swiglu_limits_shared:
                 for layer_idx, layer in enumerate(self.layers):
                     if layer.is_moe:
@@ -12329,6 +12817,12 @@ class KrasisModel:
         if self.krasis_engine is not None:
             store.setup_from_engine(self.krasis_engine)
             self._register_deepseek_v4_hash_tables(
+                store,
+                aux_device,
+                self._aux_decode_weights,
+                range(split_layer, layer_end),
+            )
+            self._register_deepseek_v4_vision_router_biases(
                 store,
                 aux_device,
                 self._aux_decode_weights,

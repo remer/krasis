@@ -1106,18 +1106,54 @@ extern "C" __global__ void deepseek_v4_window_indices_kernel(
     int rows,
     int window,
     int output_stride,
-    int physical_ring)
+    int physical_ring,
+    const int* __restrict__ vision_block_ids,
+    int sequence_length,
+    int max_image_tokens)
 {
     int column = (int)blockIdx.x * blockDim.x + threadIdx.x;
     int row = (int)blockIdx.y;
-    if (row >= rows || column >= window || positions == nullptr ||
-        output_stride < window || window <= 0) return;
+    bool vision_enabled = !physical_ring && vision_block_ids != nullptr &&
+                          sequence_length > 0 && max_image_tokens > 0;
+    int raw_width = vision_enabled
+        ? min(sequence_length, window + max_image_tokens)
+        : window;
+    if (row >= rows || column >= raw_width || positions == nullptr ||
+        output_stride < raw_width || window <= 0) return;
     int position = positions[row];
-    int count = min(position + 1, window);
-    int value = -1;
-    if (column < count) {
+    __shared__ int shared_earliest;
+    __shared__ int shared_latest;
+    if (threadIdx.x == 0) {
+        int count = min(position + 1, window);
         int earliest = position + 1 - count;
-        int absolute = earliest + column;
+        int latest = position;
+        if (vision_enabled && position >= 0 && position < sequence_length) {
+            int block = vision_block_ids[position];
+            if (block >= 0) {
+                int left = 0;
+                while (left + 1 < max_image_tokens && position - left - 1 >= 0 &&
+                       vision_block_ids[position - left - 1] == block) {
+                    ++left;
+                }
+                int right = 0;
+                while (right < max_image_tokens &&
+                       position + right + 1 < sequence_length &&
+                       vision_block_ids[position + right + 1] == block) {
+                    ++right;
+                }
+                int left_add = max(0, left - (window - 1));
+                earliest = max(0, position - (window - 1) - left_add);
+                latest = position + right;
+            }
+        }
+        shared_earliest = earliest;
+        shared_latest = latest;
+    }
+    __syncthreads();
+    int value = -1;
+    int count = shared_latest - shared_earliest + 1;
+    if (column < count) {
+        int absolute = shared_earliest + column;
         value = physical_ring ? absolute % window : absolute;
     }
     output[(int64_t)row * output_stride + column] = value;

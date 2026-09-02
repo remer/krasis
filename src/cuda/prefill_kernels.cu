@@ -4291,11 +4291,12 @@ extern "C" __global__ void deepseek_v4_sqrtsoftplus_topk_kernel(
     int* __restrict__ topk_ids,             /* [M, topk] */
     const float* __restrict__ gate,         /* [M, E] FP32 */
     const float* __restrict__ correction,   /* [E] or NULL */
+    const float* __restrict__ vision_bias,  /* [E] or NULL */
     const int* __restrict__ hash_table,     /* [vocab_size, topk] or NULL */
-    const int* __restrict__ token_ids,      /* [M], required for hash */
+    const int* __restrict__ token_ids,      /* [M], required for hash/vision */
     int E,
     int topk,
-    int hash_vocab_size)
+    int model_vocab_size)
 {
     int token = blockIdx.x;
     const float* g = gate + (int64_t)token * E;
@@ -4318,13 +4319,17 @@ extern "C" __global__ void deepseek_v4_sqrtsoftplus_topk_kernel(
     __syncthreads();
 
     if (threadIdx.x == 0) {
+        int token_id = token_ids ? token_ids[token] : -1;
+        bool image_token = vision_bias && model_vocab_size > 0 &&
+                           token_id >= model_vocab_size;
         bool valid_hash = false;
-        if (hash_table) {
-            int token_id = token_ids[token];
-            valid_hash = token_id >= 0 && token_id < hash_vocab_size;
+        bool valid_selection = false;
+        if (hash_table && !image_token) {
+            valid_hash = token_id >= 0 && token_id < model_vocab_size;
             if (valid_hash) {
                 const int* hash_row = hash_table + (int64_t)token_id * topk;
                 for (int k = 0; k < topk; ++k) ti[k] = hash_row[k];
+                valid_selection = true;
             }
         } else {
             for (int k = 0; k < topk; ++k) {
@@ -4332,7 +4337,9 @@ extern "C" __global__ void deepseek_v4_sqrtsoftplus_topk_kernel(
                 top_idxs[k] = -1;
             }
             for (int i = 0; i < E; ++i) {
-                float score = selection_scores[i];
+                float score = image_token
+                    ? raw_scores[i] + vision_bias[i]
+                    : selection_scores[i];
                 if (score > top_vals[topk - 1]) {
                     int pos = topk - 1;
                     while (pos > 0 && score > top_vals[pos - 1]) {
@@ -4345,11 +4352,12 @@ extern "C" __global__ void deepseek_v4_sqrtsoftplus_topk_kernel(
                 }
             }
             for (int k = 0; k < topk; ++k) ti[k] = top_idxs[k];
+            valid_selection = true;
         }
 
         for (int k = 0; k < topk; ++k) {
             int expert = ti[k];
-            if ((hash_table && !valid_hash) || expert < 0 || expert >= E) {
+            if (!valid_selection || expert < 0 || expert >= E) {
                 ti[k] = -1;
                 tw[k] = 0.0f;
             } else {
