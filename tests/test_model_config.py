@@ -796,6 +796,15 @@ class ModelConfigContractTests(unittest.TestCase):
         self.assertEqual(cfg.linear_kda_layers[-1], 44)
         self.assertEqual(cfg.dsa_indexer_owner_layer(43), 43)
         self.assertIsNone(cfg.dsa_indexer_owner_layer(44))
+        self.assertEqual(
+            _dsa_owner_layers_for_segment(cfg, 0, 45),
+            list(range(3, 45, 4)),
+        )
+        self.assertEqual(_dsa_owner_layers_for_segment(cfg, 0, 3), [])
+        self.assertEqual(
+            _dsa_resource_layers_for_segment(cfg, 0, 45),
+            (list(range(3, 45, 4)), []),
+        )
 
     def test_glm5_next_rejects_divergent_architecture_metadata(self) -> None:
         raw = _glm5_next_config()
@@ -975,6 +984,25 @@ class ModelConfigContractTests(unittest.TestCase):
         self.assertEqual(
             router["e_score_correction_bias"].dtype, torch.float32
         )
+
+    def test_fp32_router_uses_bf16_rust_wire_contract(self) -> None:
+        source_bf16 = torch.tensor(
+            [[1.0, -2.5, 0.125], [3.25, -0.5, 7.0]],
+            dtype=torch.bfloat16,
+        )
+        promoted = source_bf16.float()
+
+        payload = KrasisModel._routing_gate_bf16_bytes(promoted)
+
+        self.assertEqual(len(payload), source_bf16.numel() * 2)
+        self.assertEqual(
+            payload,
+            source_bf16.contiguous().view(torch.uint16).numpy().view("u1").tobytes(),
+        )
+
+    def test_routing_gate_wire_contract_rejects_non_matrix(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "rank 2"):
+            KrasisModel._routing_gate_bf16_bytes(torch.zeros(8))
 
     def test_non_dsa_defaults_remain_disabled(self) -> None:
         raw = _glm_dsa_config()

@@ -159,9 +159,17 @@ def _dsa_owner_layers_for_segment(
             f"Invalid DSA decode segment [{layer_start}, {layer_end}) for "
             f"{cfg.num_hidden_layers} layers"
         )
+    dsa_layers = [
+        layer_idx
+        for layer_idx in range(layer_start, layer_end)
+        if not (
+            cfg.is_glm5_next
+            and cfg.is_linear_attention_layer(layer_idx)
+        )
+    ]
     owners = {
         cfg.dsa_indexer_owner_layer(layer_idx)
-        for layer_idx in range(layer_start, layer_end)
+        for layer_idx in dsa_layers
     }
     if None in owners:
         raise RuntimeError(
@@ -5227,7 +5235,7 @@ class KrasisModel:
             return 0
 
         segment_contexts = set()
-        for layer_idx in range(layer_start, layer_end):
+        for layer_idx in owner_layers:
             cache, _ = self._kv_cache_slot_for_layer(layer_idx)
             segment_contexts.add(int(cache.max_pages * cache.page_size))
         if len(segment_contexts) != 1:
@@ -5361,7 +5369,7 @@ class KrasisModel:
         if not owner_layers:
             return 0
         contexts = set()
-        for layer_idx in range(layer_start, layer_end):
+        for layer_idx in owner_layers:
             cache, _ = self._kv_cache_slot_for_layer(layer_idx)
             contexts.add(int(cache.max_pages * cache.page_size))
         if len(contexts) != 1:
@@ -6811,8 +6819,7 @@ class KrasisModel:
         moe_idx = 0
         for layer in self.layers:
             if layer.is_moe:
-                gw = layer.gate_weight.cpu().contiguous()
-                gw_bytes = gw.view(torch.uint16).numpy().view(np.uint8).tobytes()
+                gw_bytes = self._routing_gate_bf16_bytes(layer.gate_weight)
                 bias_bytes = None
                 if layer.e_score_correction_bias is not None:
                     bias = layer.e_score_correction_bias.cpu().float().contiguous()
@@ -8885,6 +8892,27 @@ class KrasisModel:
             w_int8, scale = w
             return (w_int8.float() * scale.float().unsqueeze(1)).to(torch.bfloat16)
         return w
+
+    @staticmethod
+    def _routing_gate_bf16_bytes(gate_weight: torch.Tensor) -> bytes:
+        """Serialize a router gate using the Rust engine's BF16 wire contract.
+
+        Some model loaders retain router tensors in FP32 so their Python
+        reference path can express an explicit ``.float()`` operation. The
+        checkpoint values themselves are BF16, and the native CUDA router
+        consumes BF16 operands with FP32 accumulation. Normalize the dtype
+        here instead of reinterpreting an FP32 tensor as twice as many BF16
+        values.
+        """
+        gate_bf16 = gate_weight.detach().to(
+            device="cpu", dtype=torch.bfloat16
+        ).contiguous()
+        if gate_bf16.ndim != 2:
+            raise RuntimeError(
+                "Routing gate must be rank 2 before Rust serialization, got "
+                f"shape={tuple(gate_bf16.shape)}"
+            )
+        return gate_bf16.view(torch.uint16).numpy().view(np.uint8).tobytes()
 
     def _register_deepseek_v4_hash_tables(
         self,

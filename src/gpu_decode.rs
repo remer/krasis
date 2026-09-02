@@ -8412,9 +8412,61 @@ fn dsa_registered_layers(graph: &GpuDecodeGraph) -> Vec<usize> {
     graph
         .layers
         .iter()
+        .take(graph.num_layers)
         .enumerate()
         .filter_map(|(layer_idx, layer)| layer.dsa_indexer.as_ref().map(|_| layer_idx))
         .collect()
+}
+
+fn dsa_expected_layers(graph: &GpuDecodeGraph) -> Vec<usize> {
+    graph
+        .layers
+        .iter()
+        .take(graph.num_layers)
+        .enumerate()
+        .filter_map(|(layer_idx, layer)| {
+            matches!(&layer.attn, GpuAttnConfig::MLA { .. }).then_some(layer_idx)
+        })
+        .collect()
+}
+
+fn validate_dsa_layer_coverage(
+    registered_layers: &[usize],
+    expected_layers: &[usize],
+) -> Result<(), String> {
+    if registered_layers != expected_layers {
+        return Err(format!(
+            "DSA graph registration coverage mismatch: registered {:?}, expected MLA layers {:?}",
+            registered_layers, expected_layers
+        ));
+    }
+    Ok(())
+}
+
+fn dsa_expected_topk_capacity(
+    registration: &DsaIndexerRegistration,
+    logical_context_capacity: usize,
+) -> Result<usize, String> {
+    if let Some(kpool) = registration.glm5_next_kpool {
+        let expansion = kpool
+            .pool_size
+            .checked_sub(1)
+            .ok_or_else(|| "GLM-5.3 DSA k-pool size must be positive".to_string())?;
+        registration
+            .index_topk
+            .checked_add(expansion)
+            .ok_or_else(|| "GLM-5.3 expanded DSA top-k capacity overflow".to_string())
+    } else {
+        Ok(registration.index_topk.min(logical_context_capacity))
+    }
+}
+
+fn dsa_max_selected_index_capacity(registration: &DsaIndexerRegistration) -> Result<usize, String> {
+    // Legacy DSA stores at most index_topk entries. GLM-5.3's k-pool
+    // representation additionally retains the uncompressed tail of the live
+    // pool, so its physical buffer may be pool_size - 1 entries larger than
+    // the logical index_topk selection limit.
+    dsa_expected_topk_capacity(registration, usize::MAX)
 }
 
 fn validate_dsa_runtime_registration(
@@ -8459,10 +8511,13 @@ fn validate_dsa_runtime_graph(
         .iter()
         .filter_map(|layer| layer.dsa_indexer.as_ref())
         .collect::<Vec<_>>();
+    let registered_layers = dsa_registered_layers(graph);
+    let expected_layers = dsa_expected_layers(graph);
+    validate_dsa_layer_coverage(&registered_layers, &expected_layers)?;
     let runtime_context_tokens = max_tokens.max(graph.kv_max_seq);
     let index_topk = validate_dsa_runtime_registration(
         &registrations,
-        graph.layers.len(),
+        expected_layers.len(),
         runtime_context_tokens,
     )?;
     if !graph.dsa_indexer_resources_finalized {
@@ -8472,10 +8527,16 @@ fn validate_dsa_runtime_graph(
         .dsa_indexer_workspace
         .as_ref()
         .ok_or_else(|| "DSA prefill requires a full-primary indexer workspace".to_string())?;
-    if workspace.max_context_tokens < runtime_context_tokens {
+    let required_workspace_context = graph
+        .dsa_indexer_owners
+        .iter()
+        .map(DsaIndexerOwnerResource::score_capacity)
+        .max()
+        .unwrap_or(0);
+    if workspace.max_context_tokens < required_workspace_context {
         return Err(format!(
-            "DSA workspace context capacity {} is smaller than runtime context {}",
-            workspace.max_context_tokens, runtime_context_tokens
+            "DSA workspace score capacity {} is smaller than required score context {}",
+            workspace.max_context_tokens, required_workspace_context
         ));
     }
 
@@ -8509,7 +8570,8 @@ fn validate_dsa_runtime_graph(
                 owner_layer_idx, resource.max_context_tokens, runtime_context_tokens
             ));
         }
-        let expected_topk_capacity = registration.index_topk.min(resource.max_context_tokens);
+        let expected_topk_capacity =
+            dsa_expected_topk_capacity(registration, resource.max_context_tokens)?;
         if resource.topk_capacity != expected_topk_capacity
             || resource.index_head_dim != registration.index_head_dim
         {
@@ -8550,13 +8612,14 @@ pub(crate) mod dsa_registration_tests {
         measured_peer_route_admission, occupancy_active_blocks_per_multiprocessor,
         peer_selector_check_message, plan_dsa_topk, route_prep_rmsnorm_threads,
         split_expert_launch_enabled, validate_dsa_indexer_registration,
-        validate_dsa_owner_weight_contract, validate_dsa_runtime_registration,
-        validate_dspark_residency_contract, validate_stream_probe_outcome, CudaEvent, CudaStream,
-        DsaGraphScoreBackend, DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds,
-        DsparkResidencyMode, DsparkTargetCacheRowMapping, DsparkVerificationPolicy, ExpertDataPtr,
-        GpuAttnConfig, GpuDecodeStore, GpuWeight, GraphW13Path, HqqStageAsyncCopyMode,
-        PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert, PendingPeerDispatch,
-        RouteLocalityGlobalLruState, DSA_TOPK_RADIX_THREADS, MODULE_NAME,
+        validate_dsa_layer_coverage, validate_dsa_owner_weight_contract,
+        validate_dsa_runtime_registration, validate_dspark_residency_contract,
+        validate_stream_probe_outcome, CudaEvent, CudaStream, DsaGraphScoreBackend,
+        DsaIndexerOwnerResource, DsaIndexerOwnerWeightIds, DsparkResidencyMode,
+        DsparkTargetCacheRowMapping, DsparkVerificationPolicy, ExpertDataPtr,
+        Glm5NextKpoolRegistration, GpuAttnConfig, GpuDecodeStore, GpuWeight, GraphW13Path,
+        HqqStageAsyncCopyMode, PeerDemandEntry, PeerDynamicTier, PeerRoutedExpert,
+        PendingPeerDispatch, RouteLocalityGlobalLruState, DSA_TOPK_RADIX_THREADS, MODULE_NAME,
     };
 
     static DSA_CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -12134,6 +12197,46 @@ pub(crate) mod dsa_registration_tests {
     }
 
     #[test]
+    fn dsa_layer_coverage_accepts_hybrid_attention_and_rejects_gaps() {
+        let expected = [3usize, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43];
+        assert!(validate_dsa_layer_coverage(&expected, &expected).is_ok());
+
+        let missing = [3usize, 7, 11, 15, 19, 23, 27, 31, 35, 39];
+        let error = validate_dsa_layer_coverage(&missing, &expected)
+            .expect_err("a missing sparse layer must fail closed");
+        assert!(error.contains("coverage mismatch"));
+        assert!(error.contains("43"));
+
+        let unexpected = [3usize, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 44];
+        assert!(validate_dsa_layer_coverage(&unexpected, &expected).is_err());
+    }
+
+    #[test]
+    fn dsa_topk_capacity_accounts_for_glm5_next_kpool_tail() {
+        let mut registration =
+            validate_dsa_indexer_registration(3, 3, true, 2048, 128, 32, 0, 4, 0, 1536, 6144, true)
+                .expect("NoPE owner metadata");
+        assert_eq!(
+            super::dsa_expected_topk_capacity(&registration, 1024).expect("legacy capacity"),
+            1024
+        );
+
+        registration.glm5_next_kpool = Some(Glm5NextKpoolRegistration {
+            pool_size: 4,
+            always_select_tail: true,
+        });
+        assert_eq!(
+            super::dsa_expected_topk_capacity(&registration, 4096).expect("k-pool capacity"),
+            2051
+        );
+        assert_eq!(
+            super::dsa_max_selected_index_capacity(&registration)
+                .expect("k-pool physical capacity"),
+            2051
+        );
+    }
+
+    #[test]
     fn owner_resources_require_exact_bf16_shapes_and_runtime_sizing() {
         let registration = validate_dsa_indexer_registration(
             2, 2, true, 2048, 128, 32, 64, 4, 0, 2048, 6144, true,
@@ -12580,6 +12683,27 @@ pub(crate) mod dsa_registration_tests {
         store
             .finalize_dsa_indexer_resources()
             .expect("owner workspace");
+        let (ungraphed_position_ptr, ungraphed_seq_len_ptr) = {
+            let graph = store.graph.as_ref().expect("graph");
+            (
+                *graph
+                    .d_graph_pos
+                    .as_ref()
+                    .expect("DSA ungraphed position scalar")
+                    .device_ptr(),
+                *graph
+                    .d_graph_seq_len
+                    .as_ref()
+                    .expect("DSA ungraphed sequence-length scalar")
+                    .device_ptr(),
+            )
+        };
+        assert_eq!(
+            store
+                .upload_ungraphed_dsa_scalars(store.graph.as_ref().expect("graph"), 1)
+                .expect("pre-graph DSA scalar upload"),
+            Some((ungraphed_position_ptr, ungraphed_seq_len_ptr))
+        );
         store
             .device
             .bind_to_thread()
@@ -12653,6 +12777,8 @@ pub(crate) mod dsa_registration_tests {
                     .device_ptr(),
             )
         };
+        assert_eq!(d_position_ptr, ungraphed_position_ptr);
+        assert_eq!(d_seq_len_ptr, ungraphed_seq_len_ptr);
         let position = 0i32;
         unsafe {
             assert_eq!(
@@ -35332,10 +35458,31 @@ impl GpuDecodeStore {
                 None
             },
         };
+        // Correctness-first/ungraphed DSA execution is valid before CUDA graph
+        // capture.  Allocate the shared position scalars with the DSA workspace
+        // instead of relying on init_cuda_graph_buffers() to create them later.
+        let d_ungraphed_position = self.device.alloc_zeros::<i32>(1).map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "alloc DSA ungraphed position scalar: {:?}",
+                error
+            ))
+        })?;
+        let d_ungraphed_sequence_length = self.device.alloc_zeros::<i32>(1).map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "alloc DSA ungraphed sequence-length scalar: {:?}",
+                error
+            ))
+        })?;
         let graph = self
             .graph
             .as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        if graph.d_graph_pos.is_none() {
+            graph.d_graph_pos = Some(d_ungraphed_position);
+        }
+        if graph.d_graph_seq_len.is_none() {
+            graph.d_graph_seq_len = Some(d_ungraphed_sequence_length);
+        }
         graph.dsa_indexer_workspace = Some(workspace);
         graph.dsa_indexer_resources_finalized = true;
         log::info!(
@@ -45156,14 +45303,16 @@ impl GpuDecodeStore {
                 ))
             }
         };
-        if d_indices_ptr == 0 || topk_capacity == 0 || topk_capacity > registration.index_topk {
+        let maximum_topk_capacity = dsa_max_selected_index_capacity(registration)?;
+        if d_indices_ptr == 0 || topk_capacity == 0 || topk_capacity > maximum_topk_capacity {
             return Err(format!(
-                "DSA layer {} owner {} has invalid IndexShare result [ptr=0x{:x}, capacity={}, configured_topk={}]",
+                "DSA layer {} owner {} has invalid IndexShare result [ptr=0x{:x}, capacity={}, configured_topk={}, maximum_physical_capacity={}]",
                 layer_idx,
                 registration.owner_layer_idx,
                 d_indices_ptr,
                 topk_capacity,
                 registration.index_topk,
+                maximum_topk_capacity,
             ));
         }
         Ok(DsaSelectedIndexView {
@@ -50358,21 +50507,25 @@ impl GpuDecodeStore {
                 .alloc_zeros::<i32>(1)
                 .map_err(|e| format!("alloc d_graph_token_id: {:?}", e))?,
         );
-        graph.d_graph_pos = Some(
-            self.device
-                .alloc_zeros::<i32>(1)
-                .map_err(|e| format!("alloc d_graph_pos: {:?}", e))?,
-        );
+        if graph.d_graph_pos.is_none() {
+            graph.d_graph_pos = Some(
+                self.device
+                    .alloc_zeros::<i32>(1)
+                    .map_err(|e| format!("alloc d_graph_pos: {:?}", e))?,
+            );
+        }
         graph.d_graph_rope_pos = Some(
             self.device
                 .alloc_zeros::<i32>(1)
                 .map_err(|e| format!("alloc d_graph_rope_pos: {:?}", e))?,
         );
-        graph.d_graph_seq_len = Some(
-            self.device
-                .alloc_zeros::<i32>(1)
-                .map_err(|e| format!("alloc d_graph_seq_len: {:?}", e))?,
-        );
+        if graph.d_graph_seq_len.is_none() {
+            graph.d_graph_seq_len = Some(
+                self.device
+                    .alloc_zeros::<i32>(1)
+                    .map_err(|e| format!("alloc d_graph_seq_len: {:?}", e))?,
+            );
+        }
         graph.d_graph_seq_len_by_layer.clear();
         graph.d_graph_seq_len_by_layer.reserve(graph.layers.len());
         let initial_seq_len = 1i32;
@@ -64552,11 +64705,23 @@ impl GpuDecodeStore {
                 graph.hidden_size,
                 &format!("GLM-5.3 layer {} post-attention", layer_idx),
             )?;
-            let mlp_kind = match &graph.layers[layer_idx].mlp {
-                GpuMlpConfig::Dense { .. } => 0u8,
-                GpuMlpConfig::MoE { .. } => 1u8,
-                GpuMlpConfig::Gemma4MoE { .. } => 2u8,
-                GpuMlpConfig::None => 3u8,
+            // Routed MoE metadata lives in graph.moe_layers; register_mlp("moe")
+            // deliberately leaves the per-layer MLP slot as None.  Use the
+            // established global MoE registration as the authoritative signal.
+            let mlp_kind = if graph
+                .moe_layers
+                .get(layer_idx)
+                .and_then(Option::as_ref)
+                .is_some()
+            {
+                1u8
+            } else {
+                match &graph.layers[layer_idx].mlp {
+                    GpuMlpConfig::Dense { .. } => 0u8,
+                    GpuMlpConfig::MoE { .. } => 1u8,
+                    GpuMlpConfig::Gemma4MoE { .. } => 2u8,
+                    GpuMlpConfig::None => 3u8,
+                }
             };
             match mlp_kind {
                 0 => self.run_glm5_next_dense_mlp_decode_for_graph(
