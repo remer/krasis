@@ -9854,9 +9854,9 @@ mod tests {
         session_cache_multi_gpu_pending, session_cache_runtime_materialization_enabled,
         sha256_present_u64_vector, sha256_token_hash_le_u32, sha256_u64_vector,
         validate_prefix_cache_ram_fraction, validate_reference_decode_outcome, FairModelScheduler,
-        ModelRequest, ParsedToolCall, ReferenceDecodeOutcomeError, RequestOverhead,
-        ServingMetrics, ServingRequestGuard, SessionCacheMetrics, SessionCacheMissReason,
-        SessionLockKey, SessionLockTable, StreamDetokenizer,
+        ModelRequest, ParsedToolCall, ReferenceDecodeOutcomeError, RequestOverhead, ServingMetrics,
+        ServingRequestGuard, SessionCacheMetrics, SessionCacheMissReason, SessionLockKey,
+        SessionLockTable, StreamDetokenizer,
     };
     use crate::chat_template::{ChatTemplateEngine, ToolCallFormat};
     use std::fs;
