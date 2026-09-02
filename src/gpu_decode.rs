@@ -81923,8 +81923,9 @@ impl GpuDecodeStore {
             // equivalent equation but not a bitwise-equivalent reduction.
             let resident_w13_ksplits =
                 dspark_resident_w13_ksplits(resident_gelu_batch, w13_ksplits, w13_ksplits_batched);
-            let w13_n32 =
-                !resident_gelu_batch && !is_int8 && graph.deepseek_v4_decode_policy.int4_w13_n32;
+            let w13_n32 = !resident_gelu_batch
+                && !is_int8
+                && select_int4_w13_n32(graph, hs, w13_n, topk.max(1), resident_w13_ksplits)?;
             let w13_tile_width = if w13_n32 { 32 } else { 16 };
             let w13_threads = if w13_n32 { 512 } else { 256 };
             let w13_n_tiles = w13_n.div_ceil(w13_tile_width);
@@ -81992,8 +81993,16 @@ impl GpuDecodeStore {
                     })?;
             }
 
-            let w2_n32 =
-                !resident_gelu_batch && !is_int8 && graph.deepseek_v4_decode_policy.int4_w2_n32;
+            let w2_n32 = !resident_gelu_batch
+                && !is_int8
+                && select_int4_w2_n32(
+                    graph,
+                    intermediate,
+                    hs,
+                    topk.max(1),
+                    moe.swiglu_limit,
+                    moe.deepseek_v4_activation,
+                )?;
             let w2_tile_width = if w2_n32 { 32 } else { 16 };
             let w2_threads = if w2_n32 { 512 } else { 256 };
             let w2_n_tiles = hs.div_ceil(w2_tile_width);
