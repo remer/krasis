@@ -24,6 +24,7 @@ use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cudarc::driver::sys as cuda_sys;
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr};
 use pyo3::prelude::*;
+use sha2::{Digest, Sha256};
 
 use crate::weights::marlin::{
     bf16_to_f32, dequantize_marlin, dequantize_marlin_int8, generate_scale_perms,
@@ -52,6 +53,37 @@ fn prompt_hcs_log_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn prefill_sha256_hex(hasher: Sha256) -> String {
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn prompt_hcs_accounting_vectors_exact(
+    expected_layer_bitmap: &[u8],
+    observed_layer_bitmap: &[u8],
+    expected_route_sums: &[u64],
+    observed_route_sums: &[u64],
+    expected_calls_per_layer: &[u64],
+    observed_calls_per_layer: &[u64],
+    expected_record_calls: Option<u64>,
+    observed_record_call_sum: Option<u64>,
+    observed_record_calls: u64,
+    expected_route_count_sum: u64,
+    observed_route_count_sum: u64,
+) -> bool {
+    !expected_layer_bitmap.is_empty()
+        && expected_layer_bitmap == observed_layer_bitmap
+        && expected_route_sums == observed_route_sums
+        && expected_calls_per_layer == observed_calls_per_layer
+        && expected_record_calls.is_some()
+        && expected_record_calls == observed_record_call_sum
+        && observed_record_call_sum == Some(observed_record_calls)
+        && expected_route_count_sum == observed_route_count_sum
 }
 
 fn prefill_debug_enabled() -> bool {
@@ -7319,6 +7351,44 @@ fn dsa_score_context_rows(logical_context_rows: usize, context_divisor: usize) -
     logical_context_rows / context_divisor.max(1)
 }
 
+fn dsa_prefill_needs_selection_expansion(configured_topk: usize, output_topk: usize) -> bool {
+    output_topk > configured_topk
+}
+
+fn deepseek_v4_indexer_workspace_geometry(
+    layer_idx: usize,
+    compress_ratio: usize,
+    index_topk: usize,
+    index_n_heads: usize,
+    index_head_dim: usize,
+) -> Result<DsaPrefillWorkspaceGeometry, String> {
+    if compress_ratio != 4 {
+        return Err(format!(
+            "DeepSeek-V4 indexer layer {} requires ratio-4 compressed context, got {}",
+            layer_idx, compress_ratio
+        ));
+    }
+    if index_topk == 0 || index_n_heads == 0 || index_head_dim == 0 {
+        return Err(format!(
+            "DeepSeek-V4 indexer layer {} has invalid workspace geometry: topk={} heads={} head_dim={}",
+            layer_idx, index_topk, index_n_heads, index_head_dim
+        ));
+    }
+    Ok(DsaPrefillWorkspaceGeometry {
+        index_topk,
+        output_topk: index_topk,
+        // Selection receives compressed count-1 positions, not raw token
+        // positions. Dividing them again hides three quarters of the prefix.
+        // Only GEMM band planning retains the raw-token compression span.
+        context_divisor: 1,
+        causal_context_row_span: compress_ratio,
+        index_n_heads,
+        index_head_dim,
+        mla_num_heads: 0,
+        mla_ckv_cache_dim: 0,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Glm5FfnKind {
     RoutedMoe,
@@ -7669,7 +7739,10 @@ impl DsaPrefillRequestWorkspace {
                     .ok_or_else(|| "DSA prefill raw selected-index size overflow".to_string())?,
             )
             .map_err(|error| format!("alloc DSA prefill selected indices: {error}"))?,
-            d_pool_selected_indices: if context_divisor > 1 {
+            d_pool_selected_indices: if dsa_prefill_needs_selection_expansion(
+                configured_topk,
+                output_topk,
+            ) {
                 Some(
                     GpuBuf::alloc_zeroed(plan.selection_elements).map_err(|error| {
                         format!("alloc DSA prefill pooled selected indices: {error}")
@@ -10197,6 +10270,15 @@ pub struct PrefillEngine {
     pub prompt_hcs_num_moe_layers: usize,
     pub prompt_hcs_num_experts_per_layer: usize,
     pub prompt_hcs_prompt_tokens: usize,
+    pub prompt_hcs_record_calls: u64,
+    pub prompt_hcs_record_calls_per_layer: Vec<u64>,
+    pub prompt_hcs_chunk_plan: Vec<usize>,
+    pub prompt_hcs_max_chunk_tokens: usize,
+    pub prompt_hcs_sequence_start: usize,
+    pub prompt_hcs_reset_sequence_state: bool,
+    pub prompt_hcs_capture_suffix_boundary: Option<usize>,
+    pub prompt_hcs_logical_prompt_tokens: usize,
+    pub prompt_hcs_computed_suffix_tokens: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -10455,10 +10537,19 @@ impl PrefillEngine {
     fn reset_prompt_hcs_shadow(&mut self, prompt_tokens: usize) {
         self.prompt_hcs_shadow_enabled = Self::prompt_hcs_shadow_env_enabled();
         self.prompt_hcs_prompt_tokens = prompt_tokens;
+        self.prompt_hcs_chunk_plan.clear();
+        self.prompt_hcs_max_chunk_tokens = 0;
+        self.prompt_hcs_sequence_start = 0;
+        self.prompt_hcs_reset_sequence_state = false;
+        self.prompt_hcs_capture_suffix_boundary = None;
+        self.prompt_hcs_logical_prompt_tokens = 0;
+        self.prompt_hcs_computed_suffix_tokens = 0;
         if !self.prompt_hcs_shadow_enabled {
             self.prompt_hcs_counts.clear();
             self.prompt_hcs_num_moe_layers = 0;
             self.prompt_hcs_num_experts_per_layer = 0;
+            self.prompt_hcs_record_calls = 0;
+            self.prompt_hcs_record_calls_per_layer.clear();
             return;
         }
 
@@ -10481,6 +10572,10 @@ impl PrefillEngine {
         let total = num_moe_layers.saturating_mul(num_experts);
         self.prompt_hcs_counts.clear();
         self.prompt_hcs_counts.resize(total, 0);
+        self.prompt_hcs_record_calls = 0;
+        self.prompt_hcs_record_calls_per_layer.clear();
+        self.prompt_hcs_record_calls_per_layer
+            .resize(num_moe_layers, 0);
         if prompt_hcs_log_enabled() {
             eprintln!(
                 "[PROMPT-HCS] prefill collection enabled prompt_tokens={} moe_layers={} experts_per_layer={}",
@@ -10518,6 +10613,10 @@ impl PrefillEngine {
         if base + limit > self.prompt_hcs_counts.len() {
             return;
         }
+        self.prompt_hcs_record_calls = self.prompt_hcs_record_calls.saturating_add(1);
+        if let Some(calls) = self.prompt_hcs_record_calls_per_layer.get_mut(mi) {
+            *calls = calls.saturating_add(1);
+        }
         for eid in 0..limit {
             let cnt = counts[eid];
             if cnt > 0 {
@@ -10541,6 +10640,275 @@ impl PrefillEngine {
             self.prompt_hcs_num_experts_per_layer,
             self.prompt_hcs_prompt_tokens,
         ))
+    }
+
+    pub fn prompt_hcs_route_call_snapshot(&self) -> Option<(u64, Vec<u64>)> {
+        if !self.prompt_hcs_shadow_enabled
+            || self.prompt_hcs_num_moe_layers == 0
+            || self.prompt_hcs_record_calls_per_layer.len() != self.prompt_hcs_num_moe_layers
+        {
+            return None;
+        }
+        Some((
+            self.prompt_hcs_record_calls,
+            self.prompt_hcs_record_calls_per_layer.clone(),
+        ))
+    }
+
+    pub fn prompt_hcs_proof_snapshot_json(&self) -> String {
+        let layers = self.prompt_hcs_num_moe_layers;
+        let experts_per_layer = self.prompt_hcs_num_experts_per_layer;
+        let expected_vector_len = layers.checked_mul(experts_per_layer);
+        let mut arithmetic_exact = expected_vector_len == Some(self.prompt_hcs_counts.len())
+            && layers > 0
+            && experts_per_layer > 0;
+
+        let mut expected_layer_bitmap = vec![0u8; layers];
+        let mut expected_topk_per_layer = vec![0usize; layers];
+        for layer in &self.layer_weights {
+            if let Some(moe_layer_idx) = layer.moe_layer_idx {
+                if moe_layer_idx >= layers
+                    || expected_layer_bitmap[moe_layer_idx] != 0
+                    || layer.moe_num_experts != experts_per_layer
+                    || layer.moe_topk == 0
+                {
+                    arithmetic_exact = false;
+                    continue;
+                }
+                expected_layer_bitmap[moe_layer_idx] = 1;
+                expected_topk_per_layer[moe_layer_idx] = layer.moe_topk;
+            }
+        }
+        let observed_layer_bitmap: Vec<u8> = self
+            .prompt_hcs_record_calls_per_layer
+            .iter()
+            .map(|&calls| u8::from(calls > 0))
+            .collect();
+        if observed_layer_bitmap.len() != layers {
+            arithmetic_exact = false;
+        }
+
+        let mut per_layer_route_sums = Vec::with_capacity(layers);
+        let mut observed_route_count_sum = 0u64;
+        if experts_per_layer > 0 && self.prompt_hcs_counts.len() == layers * experts_per_layer {
+            for layer_counts in self.prompt_hcs_counts.chunks_exact(experts_per_layer) {
+                let mut layer_sum = 0u64;
+                for &count in layer_counts {
+                    match layer_sum.checked_add(count) {
+                        Some(sum) => layer_sum = sum,
+                        None => arithmetic_exact = false,
+                    }
+                }
+                match observed_route_count_sum.checked_add(layer_sum) {
+                    Some(sum) => observed_route_count_sum = sum,
+                    None => arithmetic_exact = false,
+                }
+                per_layer_route_sums.push(layer_sum);
+            }
+        } else {
+            arithmetic_exact = false;
+        }
+
+        let mut expected_per_layer_route_sums = Vec::with_capacity(layers);
+        let mut expected_route_count_sum = 0u64;
+        for (&present, &topk) in expected_layer_bitmap
+            .iter()
+            .zip(expected_topk_per_layer.iter())
+        {
+            let expected = if present == 1 {
+                (self.prompt_hcs_prompt_tokens as u64).checked_mul(topk as u64)
+            } else {
+                Some(0)
+            };
+            match expected {
+                Some(value) => {
+                    expected_per_layer_route_sums.push(value);
+                    match expected_route_count_sum.checked_add(value) {
+                        Some(sum) => expected_route_count_sum = sum,
+                        None => arithmetic_exact = false,
+                    }
+                }
+                None => {
+                    arithmetic_exact = false;
+                    expected_per_layer_route_sums.push(0);
+                }
+            }
+        }
+
+        let expected_calls_per_layer = self.prompt_hcs_chunk_plan.len() as u64;
+        let expected_record_calls_per_layer: Vec<u64> = expected_layer_bitmap
+            .iter()
+            .map(|&present| {
+                if present == 1 {
+                    expected_calls_per_layer
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let expected_record_calls = expected_record_calls_per_layer
+            .iter()
+            .try_fold(0u64, |sum, &calls| sum.checked_add(calls));
+        let observed_record_call_sum = self
+            .prompt_hcs_record_calls_per_layer
+            .iter()
+            .try_fold(0u64, |sum, &calls| sum.checked_add(calls));
+        if expected_record_calls.is_none() || observed_record_call_sum.is_none() {
+            arithmetic_exact = false;
+        }
+
+        let mut chunk_plan_hasher = Sha256::new();
+        for &tokens in &self.prompt_hcs_chunk_plan {
+            chunk_plan_hasher.update((tokens as u64).to_le_bytes());
+        }
+        let chunk_token_sum = self
+            .prompt_hcs_chunk_plan
+            .iter()
+            .try_fold(0usize, |sum, &tokens| sum.checked_add(tokens));
+        let max_planned_chunk_tokens = self
+            .prompt_hcs_chunk_plan
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let chunk_plan_complete = !self.prompt_hcs_chunk_plan.is_empty()
+            && self.prompt_hcs_chunk_plan.iter().all(|&tokens| tokens > 0)
+            && chunk_token_sum == Some(self.prompt_hcs_computed_suffix_tokens)
+            && max_planned_chunk_tokens > 0
+            && max_planned_chunk_tokens <= self.prompt_hcs_max_chunk_tokens;
+
+        let mut route_count_hasher = Sha256::new();
+        for &count in &self.prompt_hcs_counts {
+            route_count_hasher.update(count.to_le_bytes());
+        }
+        let mut expected_layer_bitmap_hasher = Sha256::new();
+        expected_layer_bitmap_hasher.update(&expected_layer_bitmap);
+        let mut observed_layer_bitmap_hasher = Sha256::new();
+        observed_layer_bitmap_hasher.update(&observed_layer_bitmap);
+        let mut expected_route_sum_hasher = Sha256::new();
+        for (&present, &sum) in expected_layer_bitmap
+            .iter()
+            .zip(expected_per_layer_route_sums.iter())
+        {
+            expected_route_sum_hasher.update([present]);
+            expected_route_sum_hasher.update(sum.to_le_bytes());
+        }
+        let mut observed_route_sum_hasher = Sha256::new();
+        for (&present, &sum) in observed_layer_bitmap
+            .iter()
+            .zip(per_layer_route_sums.iter())
+        {
+            observed_route_sum_hasher.update([present]);
+            observed_route_sum_hasher.update(sum.to_le_bytes());
+        }
+        let mut expected_call_hasher = Sha256::new();
+        for &calls in &expected_record_calls_per_layer {
+            expected_call_hasher.update(calls.to_le_bytes());
+        }
+        let mut observed_call_hasher = Sha256::new();
+        for &calls in &self.prompt_hcs_record_calls_per_layer {
+            observed_call_hasher.update(calls.to_le_bytes());
+        }
+
+        let expected_layer_bitmap_sha256 = prefill_sha256_hex(expected_layer_bitmap_hasher);
+        let observed_layer_bitmap_sha256 = prefill_sha256_hex(observed_layer_bitmap_hasher);
+        let expected_per_layer_route_sum_sha256 = prefill_sha256_hex(expected_route_sum_hasher);
+        let observed_per_layer_route_sum_sha256 = prefill_sha256_hex(observed_route_sum_hasher);
+        let expected_per_layer_record_calls_sha256 = prefill_sha256_hex(expected_call_hasher);
+        let observed_per_layer_record_calls_sha256 = prefill_sha256_hex(observed_call_hasher);
+        let layer_coverage_exact = expected_layer_bitmap == observed_layer_bitmap;
+        let per_layer_route_sums_exact = expected_per_layer_route_sums == per_layer_route_sums;
+        let per_layer_call_counts_exact =
+            expected_record_calls_per_layer == self.prompt_hcs_record_calls_per_layer;
+        let route_count_arithmetic_exact = arithmetic_exact
+            && observed_route_count_sum == expected_route_count_sum
+            && observed_record_call_sum == expected_record_calls
+            && self.prompt_hcs_record_calls == observed_record_call_sum.unwrap_or(u64::MAX);
+        let accounting_vectors_exact = prompt_hcs_accounting_vectors_exact(
+            &expected_layer_bitmap,
+            &observed_layer_bitmap,
+            &expected_per_layer_route_sums,
+            &per_layer_route_sums,
+            &expected_record_calls_per_layer,
+            &self.prompt_hcs_record_calls_per_layer,
+            expected_record_calls,
+            observed_record_call_sum,
+            self.prompt_hcs_record_calls,
+            expected_route_count_sum,
+            observed_route_count_sum,
+        );
+        let fresh_geometry_exact = self.prompt_hcs_sequence_start == 0
+            && self.prompt_hcs_reset_sequence_state
+            && self.prompt_hcs_capture_suffix_boundary.is_none()
+            && self.prompt_hcs_logical_prompt_tokens == self.prompt_hcs_prompt_tokens
+            && self.prompt_hcs_computed_suffix_tokens == self.prompt_hcs_prompt_tokens;
+        let available = self.prompt_hcs_shadow_enabled
+            && chunk_plan_complete
+            && fresh_geometry_exact
+            && route_count_arithmetic_exact
+            && accounting_vectors_exact;
+
+        let chunk_plan_authority = serde_json::json!({
+            "schema": "krasis_prefill_chunk_plan_authority_v1",
+            "available": chunk_plan_complete && fresh_geometry_exact,
+            "encoding": "sha256(concat(chunk_tokens.to_le_bytes_u64()) for chunk_tokens in plan)",
+            "sha256_le_u64": prefill_sha256_hex(chunk_plan_hasher),
+            "chunk_count": self.prompt_hcs_chunk_plan.len(),
+            "chunk_token_sum": chunk_token_sum,
+            "max_chunk_tokens": self.prompt_hcs_max_chunk_tokens,
+            "max_planned_chunk_tokens": max_planned_chunk_tokens,
+            "computed_suffix_tokens": self.prompt_hcs_computed_suffix_tokens,
+            "logical_prompt_tokens": self.prompt_hcs_logical_prompt_tokens,
+            "sequence_start": self.prompt_hcs_sequence_start,
+            "reset_sequence_state": self.prompt_hcs_reset_sequence_state,
+            "capture_suffix_boundary": self.prompt_hcs_capture_suffix_boundary,
+            "complete": chunk_plan_complete,
+        });
+        let mut payload = serde_json::json!({
+            "schema": "krasis_prompt_hcs_prefill_authority_v1",
+            "available": available,
+            "collection_path": "fused_moe_exact_route_counts",
+            "collection_enabled": self.prompt_hcs_shadow_enabled,
+            "prompt_tokens": self.prompt_hcs_prompt_tokens,
+            "moe_layer_slots": layers,
+            "experts_per_layer": experts_per_layer,
+            "count_vector_len": self.prompt_hcs_counts.len(),
+            "expected_count_vector_len": expected_vector_len,
+            "count_nonzero": self.prompt_hcs_counts.iter().filter(|&&count| count > 0).count(),
+            "count_sum": observed_route_count_sum,
+            "expected_route_count_sum": expected_route_count_sum,
+            "observed_route_count_sum": observed_route_count_sum,
+            "count_sha256_le_u64": prefill_sha256_hex(route_count_hasher),
+            "expected_layer_bitmap_sha256": expected_layer_bitmap_sha256,
+            "observed_layer_bitmap_sha256": observed_layer_bitmap_sha256,
+        });
+        let accounting = serde_json::json!({
+            "expected_per_layer_route_sum_sha256": expected_per_layer_route_sum_sha256,
+            "observed_per_layer_route_sum_sha256": observed_per_layer_route_sum_sha256,
+            "expected_per_layer_record_calls_sha256": expected_per_layer_record_calls_sha256,
+            "observed_per_layer_record_calls_sha256": observed_per_layer_record_calls_sha256,
+            "expected_calls_per_layer": expected_calls_per_layer,
+            "expected_record_calls": expected_record_calls,
+            "record_calls": self.prompt_hcs_record_calls,
+            "observed_record_call_sum": observed_record_call_sum,
+            "layer_coverage_exact": layer_coverage_exact,
+            "per_layer_route_sums_exact": per_layer_route_sums_exact,
+            "per_layer_call_counts_exact": per_layer_call_counts_exact,
+            "accounting_vectors_exact": accounting_vectors_exact,
+            "route_count_arithmetic_exact": route_count_arithmetic_exact,
+            "fresh_geometry_exact": fresh_geometry_exact,
+            "chunk_plan": chunk_plan_authority,
+        });
+        payload
+            .as_object_mut()
+            .expect("prefill authority payload is an object")
+            .extend(
+                accounting
+                    .as_object()
+                    .expect("prefill authority accounting is an object")
+                    .clone(),
+            );
+        payload.to_string()
     }
 
     fn reset_prefill_prescan_accuracy_measurement(
@@ -25188,6 +25556,13 @@ impl PrefillEngine {
         } else {
             build_prefill_chunk_plan_at_boundary(total_m, max_chunk, capture_suffix_boundary)?
         };
+        self.prompt_hcs_chunk_plan = chunk_plan.clone();
+        self.prompt_hcs_max_chunk_tokens = max_chunk;
+        self.prompt_hcs_sequence_start = sequence_start;
+        self.prompt_hcs_reset_sequence_state = reset_sequence_state;
+        self.prompt_hcs_capture_suffix_boundary = capture_suffix_boundary;
+        self.prompt_hcs_logical_prompt_tokens = total_prompt_tokens;
+        self.prompt_hcs_computed_suffix_tokens = total_m;
         let num_chunks = chunk_plan.len();
         let chunk_size = chunk_plan.iter().copied().max().unwrap_or(0);
         self.reset_prefill_prescan_accuracy_measurement(total_m, &chunk_plan);
@@ -35019,7 +35394,11 @@ impl PrefillEngine {
                 ));
             }
             let history_ptr = *history.device_ptr();
-            if self.active_prefill_chunk_idx == 0 && first_group > 0 {
+            // Native history is one request-scoped scratch buffer shared by
+            // every layer and by the main and learned-index compressors. It
+            // cannot retain this compressor's prefix across either layers or
+            // prefill chunks, so restore the current owner before appending.
+            if first_group > 0 {
                 self.unpack_deepseek_v4_native_cache(native, history_ptr, first_group, 0, label)?;
             }
             Some(history_ptr)
@@ -41433,16 +41812,13 @@ impl PrefillEngine {
             let Some(indexer) = descriptor.indexer.as_ref() else {
                 continue;
             };
-            let current = DsaPrefillWorkspaceGeometry {
-                index_topk: indexer.index_topk,
-                output_topk: indexer.index_topk,
-                context_divisor: 1,
-                causal_context_row_span: descriptor.compress_ratio,
-                index_n_heads: indexer.index_n_heads,
-                index_head_dim: indexer.index_head_dim,
-                mla_num_heads: 0,
-                mla_ckv_cache_dim: 0,
-            };
+            let current = deepseek_v4_indexer_workspace_geometry(
+                layer_idx,
+                descriptor.compress_ratio,
+                indexer.index_topk,
+                indexer.index_n_heads,
+                indexer.index_head_dim,
+            )?;
             if let Some(expected) = geometry {
                 if expected != current {
                     return Err(format!(
@@ -77923,6 +78299,75 @@ Set KRASIS_NO_FLA=1 only if you explicitly want the slower custom LA path."
 // See feature-unit-test.md for architecture and rationale.
 //
 #[cfg(test)]
+mod prompt_hcs_authority_tests {
+    use super::prompt_hcs_accounting_vectors_exact;
+
+    fn exact() -> bool {
+        prompt_hcs_accounting_vectors_exact(
+            &[1, 1],
+            &[1, 1],
+            &[60, 60],
+            &[60, 60],
+            &[2, 2],
+            &[2, 2],
+            Some(4),
+            Some(4),
+            4,
+            120,
+            120,
+        )
+    }
+
+    #[test]
+    fn prompt_hcs_accounting_accepts_exact_layer_route_and_call_vectors() {
+        assert!(exact());
+    }
+
+    #[test]
+    fn prompt_hcs_accounting_rejects_layer_route_or_call_gaps() {
+        assert!(!prompt_hcs_accounting_vectors_exact(
+            &[1, 1],
+            &[1, 0],
+            &[60, 60],
+            &[60, 60],
+            &[2, 2],
+            &[2, 2],
+            Some(4),
+            Some(4),
+            4,
+            120,
+            120,
+        ));
+        assert!(!prompt_hcs_accounting_vectors_exact(
+            &[1, 1],
+            &[1, 1],
+            &[60, 60],
+            &[60, 59],
+            &[2, 2],
+            &[2, 2],
+            Some(4),
+            Some(4),
+            4,
+            120,
+            119,
+        ));
+        assert!(!prompt_hcs_accounting_vectors_exact(
+            &[1, 1],
+            &[1, 1],
+            &[60, 60],
+            &[60, 60],
+            &[2, 2],
+            &[2, 1],
+            Some(4),
+            Some(3),
+            3,
+            120,
+            120,
+        ));
+    }
+}
+
+#[cfg(test)]
 mod chunk_plan_tests {
     use super::{
         build_balanced_prefill_chunk_plan, build_balanced_prefill_chunk_plan_at_boundary,
@@ -83412,11 +83857,41 @@ mod kernel_tests {
     }
 
     #[test]
+    fn test_deepseek_v4_prefill_causal_positions_are_not_compressed_twice() {
+        let geometry = deepseek_v4_indexer_workspace_geometry(2, 4, 512, 64, 128).unwrap();
+        // DeepSeek's compressor already converts raw positions to count-1
+        // positions. CUDA selection computes (position + 1) / divisor, while
+        // GEMM band planning still spans four raw tokens per compressed row.
+        assert_eq!(geometry.causal_context_row_span, 4);
+        for raw_position in -1i64..200_000 {
+            let reference_visible = (raw_position + 1).max(0) as usize / 4;
+            let selection_position = reference_visible as i64 - 1;
+            let actual_visible =
+                (selection_position + 1).max(0) as usize / geometry.context_divisor;
+            assert_eq!(
+                actual_visible, reference_visible,
+                "raw position {raw_position}"
+            );
+        }
+    }
+
+    #[test]
     fn test_dsa_prefill_selection_plan() {
         assert_eq!(dsa_score_context_rows(300, 4), 75);
         assert_eq!(dsa_score_context_rows(303, 4), 75);
         assert_eq!(dsa_score_context_rows(304, 4), 76);
         assert_eq!(dsa_score_context_rows(303, 1), 303);
+        let deepseek_v4 = deepseek_v4_indexer_workspace_geometry(2, 4, 512, 64, 128).unwrap();
+        assert_eq!(deepseek_v4.context_divisor, 1);
+        assert_eq!(deepseek_v4.causal_context_row_span, 4);
+        assert_eq!(deepseek_v4.index_topk, 512);
+        assert_eq!(deepseek_v4.output_topk, 512);
+        assert!(!dsa_prefill_needs_selection_expansion(
+            deepseek_v4.index_topk,
+            deepseek_v4.output_topk,
+        ));
+        assert!(deepseek_v4_indexer_workspace_geometry(2, 1, 512, 64, 128).is_err());
+        assert!(deepseek_v4_indexer_workspace_geometry(2, 4, 0, 64, 128).is_err());
         assert_eq!(glm5_ffn_kind(true, false).unwrap(), Glm5FfnKind::RoutedMoe);
         assert_eq!(glm5_ffn_kind(false, true).unwrap(), Glm5FfnKind::Dense);
         assert!(glm5_ffn_kind(true, true).is_err());
@@ -83446,6 +83921,7 @@ mod kernel_tests {
             pooled.workspace_selection_geometry().unwrap(),
             (512, 2051, 4)
         );
+        assert!(dsa_prefill_needs_selection_expansion(512, 2051));
         assert_eq!(pooled.selection_context_divisor().unwrap(), 4);
         assert_eq!(
             DsaPrefillLayerDescriptor {
@@ -92345,6 +92821,8 @@ mod kernel_tests {
 
         for code_bits in [8usize, 4usize] {
             let rows = 3usize;
+            let destination_row = 14_792usize;
+            let cache_rows = destination_row + rows;
             let width = 128usize;
             let quant_cols = if code_bits == 8 { 64usize } else { width };
             let block_size = if code_bits == 8 { 64usize } else { 32usize };
@@ -92362,16 +92840,16 @@ mod kernel_tests {
             let d_values = ctx.upload_bf16(&bytes);
             let d_output = ctx.alloc_bf16(rows * width);
             let code_elems = if code_bits == 8 {
-                rows * quant_cols
+                cache_rows * quant_cols
             } else {
-                rows * width.div_ceil(2)
+                cache_rows * width.div_ceil(2)
             };
             let d_codes = ctx.alloc_u8(code_elems);
             let d_scales = ctx
                 .dev
-                .alloc_zeros::<i8>(rows * quant_cols.div_ceil(block_size))
+                .alloc_zeros::<i8>(cache_rows * quant_cols.div_ceil(block_size))
                 .unwrap();
-            let d_tails = ctx.alloc_bf16(rows * (width - quant_cols));
+            let d_tails = ctx.alloc_bf16(cache_rows * (width - quant_cols));
             let pack = ctx.get_kernel(if code_bits == 8 {
                 "deepseek_v4_pack_fp8_native_kernel"
             } else {
@@ -92391,7 +92869,7 @@ mod kernel_tests {
             let mut p5 = width as i32;
             let mut p6 = quant_cols as i32;
             let mut p7 = block_size as i32;
-            let mut p8 = 0i32;
+            let mut p8 = destination_row as i32;
             unsafe {
                 let mut params = if code_bits == 8 {
                     vec![
@@ -92440,7 +92918,7 @@ mod kernel_tests {
                 let mut u5 = width as i32;
                 let mut u6 = quant_cols as i32;
                 let mut u7 = block_size as i32;
-                let mut u8 = 0i32;
+                let mut u8 = destination_row as i32;
                 let mut params = if code_bits == 8 {
                     vec![
                         &mut u0 as *mut _ as *mut std::ffi::c_void,
