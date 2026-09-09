@@ -7377,7 +7377,10 @@ fn deepseek_v4_indexer_workspace_geometry(
     Ok(DsaPrefillWorkspaceGeometry {
         index_topk,
         output_topk: index_topk,
-        context_divisor: compress_ratio,
+        // Selection receives compressed count-1 positions, not raw token
+        // positions. Dividing them again hides three quarters of the prefix.
+        // Only GEMM band planning retains the raw-token compression span.
+        context_divisor: 1,
         causal_context_row_span: compress_ratio,
         index_n_heads,
         index_head_dim,
@@ -83854,13 +83857,32 @@ mod kernel_tests {
     }
 
     #[test]
+    fn test_deepseek_v4_prefill_causal_positions_are_not_compressed_twice() {
+        let geometry = deepseek_v4_indexer_workspace_geometry(2, 4, 512, 64, 128).unwrap();
+        // DeepSeek's compressor already converts raw positions to count-1
+        // positions. CUDA selection computes (position + 1) / divisor, while
+        // GEMM band planning still spans four raw tokens per compressed row.
+        assert_eq!(geometry.causal_context_row_span, 4);
+        for raw_position in -1i64..200_000 {
+            let reference_visible = (raw_position + 1).max(0) as usize / 4;
+            let selection_position = reference_visible as i64 - 1;
+            let actual_visible =
+                (selection_position + 1).max(0) as usize / geometry.context_divisor;
+            assert_eq!(
+                actual_visible, reference_visible,
+                "raw position {raw_position}"
+            );
+        }
+    }
+
+    #[test]
     fn test_dsa_prefill_selection_plan() {
         assert_eq!(dsa_score_context_rows(300, 4), 75);
         assert_eq!(dsa_score_context_rows(303, 4), 75);
         assert_eq!(dsa_score_context_rows(304, 4), 76);
         assert_eq!(dsa_score_context_rows(303, 1), 303);
         let deepseek_v4 = deepseek_v4_indexer_workspace_geometry(2, 4, 512, 64, 128).unwrap();
-        assert_eq!(deepseek_v4.context_divisor, 4);
+        assert_eq!(deepseek_v4.context_divisor, 1);
         assert_eq!(deepseek_v4.causal_context_row_span, 4);
         assert_eq!(deepseek_v4.index_topk, 512);
         assert_eq!(deepseek_v4.output_topk, 512);
